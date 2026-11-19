@@ -1,7 +1,14 @@
 // Sala colaborativa: fila de músicas votadas em conjunto.
 // Como não há back-end, todos os dados ficam armazenados no navegador via localStorage.
+// As chamadas ao Spotify passam por GrooveFlowAuth.spotifyFetch (auth.js).
 
 const CollabRoom = (() => {
+  const API_BASE = "https://api.spotify.com/v1";
+  const PLACEHOLDER_ART = "https://placehold.co/56x56/1DB954/111111?text=♪";
+  const SEARCH_DEBOUNCE_MS = 350;
+  const MAX_QUEUE_ITEMS = 500;
+  const TRACK_URI_PATTERN = /^spotify:(track|episode):[A-Za-z0-9]{1,64}$/;
+
   const collabSearchInput = document.getElementById("collab-search-input");
   const collabSearchResults = document.getElementById("collab-search-results");
   const collabQueue = document.getElementById("collab-queue");
@@ -12,22 +19,74 @@ const CollabRoom = (() => {
 
   const storageKey = "grooveflow_collab_queue";
 
-  function getAccessToken() {
-    return localStorage.getItem("spotify_access_token");
+  const state = {
+    searchTracks: [],
+    searchTimer: null,
+    searchSequence: 0,
+  };
+
+  const escapeHtml = (value) => window.GrooveFlowAuth.escapeHtml(value);
+
+  function spotifyFetch(url, options = {}) {
+    return window.GrooveFlowAuth.spotifyFetch(url, options);
   }
 
-  function getStoredUser() {
-    const rawUser = localStorage.getItem("spotify_user");
-    if (!rawUser) {
+  function hasSession() {
+    return window.GrooveFlowAuth.hasSession();
+  }
+
+  function renderEmpty(container, message) {
+    if (container) {
+      container.innerHTML = `<div class="playlist-empty">${escapeHtml(message)}</div>`;
+    }
+  }
+
+  function createItemId(uri) {
+    return `${uri}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  // Normaliza um item da fila; devolve null se não for uma música válida do Spotify.
+  // Usado tanto para o localStorage quanto para códigos importados de outras pessoas.
+  function sanitizeQueueItem(rawItem) {
+    if (!rawItem || typeof rawItem !== "object") {
       return null;
     }
 
-    try {
-      return JSON.parse(rawUser);
-    } catch (error) {
-      console.warn("Usuário salvo sem formato válido.", error);
+    const uri = typeof rawItem.uri === "string" ? rawItem.uri.trim() : "";
+    if (!TRACK_URI_PATTERN.test(uri)) {
       return null;
     }
+
+    const image = typeof rawItem.image === "string" && /^https:\/\//i.test(rawItem.image) ? rawItem.image : "";
+    const votes = Number.isFinite(Number(rawItem.votes)) ? Math.max(0, Math.min(1000000, Math.floor(Number(rawItem.votes)))) : 0;
+
+    return {
+      id: typeof rawItem.id === "string" && rawItem.id ? rawItem.id.slice(0, 200) : createItemId(uri),
+      uri,
+      name: String(rawItem.name || "Música sem nome").slice(0, 200),
+      artist: String(rawItem.artist || "").slice(0, 300),
+      image,
+      votes,
+    };
+  }
+
+  function sanitizeQueue(rawQueue) {
+    if (!Array.isArray(rawQueue)) {
+      return [];
+    }
+
+    const seenIds = new Set();
+    return rawQueue
+      .map(sanitizeQueueItem)
+      .filter(Boolean)
+      .filter((item) => {
+        if (seenIds.has(item.id)) {
+          return false;
+        }
+        seenIds.add(item.id);
+        return true;
+      })
+      .slice(0, MAX_QUEUE_ITEMS);
   }
 
   function loadQueue() {
@@ -38,7 +97,7 @@ const CollabRoom = (() => {
     }
 
     try {
-      return JSON.parse(savedQueue);
+      return sanitizeQueue(JSON.parse(savedQueue));
     } catch (error) {
       console.warn("Fila da sala em formato inválido.", error);
       return [];
@@ -55,57 +114,7 @@ const CollabRoom = (() => {
   }
 
   function showQueueStatus(message) {
-    if (!collabQueue) {
-      return;
-    }
-
-    collabQueue.innerHTML = `
-      <div class="playlist-empty">
-        ${message}
-      </div>
-    `;
-  }
-
-  async function spotifyFetch(url, options = {}) {
-    const token = getAccessToken();
-
-    if (!token) {
-      throw new Error("Faça login no Spotify para criar uma playlist oficial.");
-    }
-
-    const response = await fetch(url, {
-      ...options,
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-        ...(options.headers || {}),
-      },
-    });
-
-    if (response.status === 401) {
-      if (window.GrooveFlowAuth) {
-        window.GrooveFlowAuth.handleSessionExpired(false);
-      }
-      throw new Error("Sua sessão do Spotify expirou. Faça login novamente para continuar.");
-    }
-
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Spotify respondeu com erro: ${text}`);
-    }
-
-    if (response.status === 204) {
-      return null;
-    }
-
-    return response.json();
-  }
-
-  function sortQueue() {
-    const queue = getQueueSorted();
-    saveQueue(queue);
-    renderQueue();
+    renderEmpty(collabQueue, message);
   }
 
   function renderQueue() {
@@ -124,43 +133,53 @@ const CollabRoom = (() => {
       .map(
         (item, index) => `
           <div class="collab-queue-item">
-            <img class="collab-queue-art" src="${item.image || "https://placehold.co/56x56/1DB954/111111?text=♪"}" alt="Capa da música ${item.name}" />
+            <img class="collab-queue-art" src="${escapeHtml(item.image || PLACEHOLDER_ART)}" alt="Capa da música ${escapeHtml(item.name)}" />
             <div class="collab-queue-meta">
-              <strong>${index + 1}. ${item.name}</strong>
-              <span>${item.artist}</span>
+              <strong>${index + 1}. ${escapeHtml(item.name)}</strong>
+              <span>${escapeHtml(item.artist)}</span>
             </div>
             <div class="collab-queue-actions">
-              <button class="vote-btn" type="button" data-action="upvote" data-id="${item.id}">Curtir</button>
+              <button class="vote-btn" type="button" data-action="upvote" data-id="${escapeHtml(item.id)}">Curtir</button>
               <span class="vote-count">${item.votes}</span>
-              <button class="remove-queue-btn" type="button" data-action="remove" data-id="${item.id}">Remover</button>
+              <button class="remove-queue-btn" type="button" data-action="remove" data-id="${escapeHtml(item.id)}">Remover</button>
             </div>
           </div>
         `
       )
       .join("");
+  }
 
-    collabQueue.querySelectorAll("[data-action='upvote']").forEach((button) => {
-      button.addEventListener("click", () => {
-        const queue = loadQueue();
-        const item = queue.find((track) => track.id === button.dataset.id);
+  function handleQueueClick(event) {
+    const button = event.target.closest("button[data-action]");
+    if (!button) {
+      return;
+    }
 
-        if (!item) {
-          return;
-        }
+    const queue = loadQueue();
 
-        item.votes = (item.votes || 0) + 1;
-        saveQueue(queue);
-        renderQueue();
-      });
-    });
+    if (button.dataset.action === "upvote") {
+      const item = queue.find((track) => track.id === button.dataset.id);
+      if (!item) {
+        return;
+      }
+      item.votes = (item.votes || 0) + 1;
+      saveQueue(queue);
+      renderQueue();
+      return;
+    }
 
-    collabQueue.querySelectorAll("[data-action='remove']").forEach((button) => {
-      button.addEventListener("click", () => {
-        const queue = loadQueue().filter((track) => track.id !== button.dataset.id);
-        saveQueue(queue);
-        renderQueue();
-      });
-    });
+    if (button.dataset.action === "remove") {
+      saveQueue(queue.filter((track) => track.id !== button.dataset.id));
+      renderQueue();
+    }
+  }
+
+  function getArtistNames(track) {
+    return Array.isArray(track?.artists) ? track.artists.map((artist) => artist.name).join(", ") : "";
+  }
+
+  function getTrackImage(track) {
+    return track.album?.images?.[2]?.url || track.album?.images?.[0]?.url || "";
   }
 
   async function searchTracksInRoom(query) {
@@ -168,76 +187,103 @@ const CollabRoom = (() => {
       return;
     }
 
-    if (!query.trim()) {
+    const sequence = ++state.searchSequence;
+    const term = (query || "").trim();
+
+    if (!term) {
+      state.searchTracks = [];
       collabSearchResults.innerHTML = "";
       return;
     }
 
-    if (!getAccessToken()) {
-      collabSearchResults.innerHTML = `
-        <div class="playlist-empty">
-          Faça login no Spotify para buscar músicas e montar a fila da sala.
-        </div>
-      `;
+    if (!hasSession()) {
+      renderEmpty(collabSearchResults, "Faça login no Spotify para buscar músicas e montar a fila da sala.");
       return;
     }
 
     try {
-      const endpoint = `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track&limit=6&market=BR`;
+      const endpoint = `${API_BASE}/search?q=${encodeURIComponent(term)}&type=track&limit=6&offset=0&market=BR`;
       const result = await spotifyFetch(endpoint);
-      const tracks = result.tracks?.items || [];
+
+      if (sequence !== state.searchSequence) {
+        return;
+      }
+
+      const tracks = (result?.tracks?.items || []).filter((track) => track && track.uri);
+      state.searchTracks = tracks;
 
       if (!tracks.length) {
-        collabSearchResults.innerHTML = `
-          <div class="playlist-empty">
-            Nenhuma música encontrada para "${query}".
-          </div>
-        `;
+        renderEmpty(collabSearchResults, `Nenhuma música encontrada para "${term}".`);
         return;
       }
 
       collabSearchResults.innerHTML = tracks
         .map(
-          (track) => `
+          (track, index) => `
             <div class="collab-track-item">
-              <img class="collab-track-art" src="${track.album?.images?.[2]?.url || "https://placehold.co/56x56/1DB954/111111?text=♪"}" alt="Capa da música ${track.name}" />
+              <img class="collab-track-art" src="${escapeHtml(getTrackImage(track) || PLACEHOLDER_ART)}" alt="Capa da música ${escapeHtml(track.name)}" />
               <div class="collab-track-meta">
-                <strong>${track.name}</strong>
-                <span>${track.artists.map((artist) => artist.name).join(", ")}</span>
+                <strong>${escapeHtml(track.name)}</strong>
+                <span>${escapeHtml(getArtistNames(track))}</span>
               </div>
               <div class="collab-track-actions">
-                <button class="add-queue-btn" type="button" data-action="add-to-queue" data-track-uri="${track.uri}" data-track-name="${track.name}" data-track-artist="${track.artists.map((artist) => artist.name).join(", ")}" data-track-image="${track.album?.images?.[2]?.url || "https://placehold.co/56x56/1DB954/111111?text=♪"}">Adicionar à fila</button>
+                <button class="add-queue-btn" type="button" data-action="add-to-queue" data-track-index="${index}">Adicionar à fila</button>
               </div>
             </div>
           `
         )
         .join("");
-
-      collabSearchResults.querySelectorAll("[data-action='add-to-queue']").forEach((button) => {
-        button.addEventListener("click", () => {
-          const queue = loadQueue();
-          const newItem = {
-            id: `${button.dataset.trackUri}-${Date.now()}`,
-            uri: button.dataset.trackUri,
-            name: button.dataset.trackName,
-            artist: button.dataset.trackArtist,
-            image: button.dataset.trackImage,
-            votes: 1,
-          };
-
-          queue.push(newItem);
-          saveQueue(queue);
-          renderQueue();
-          collabSearchResults.innerHTML = "";
-          if (collabSearchInput) collabSearchInput.value = "";
-        });
-      });
     } catch (error) {
-      collabSearchResults.innerHTML = `
-        <div class="playlist-empty">
-          ${error.message || "Não foi possível pesquisar músicas para a sala."}
-        </div>
-      `;
+      if (sequence === state.searchSequence) {
+        renderEmpty(collabSearchResults, error.message || "Não foi possível pesquisar músicas para a sala.");
+      }
+    }
+  }
+
+  function handleSearchResultsClick(event) {
+    const button = event.target.closest("[data-action='add-to-queue']");
+    if (!button) {
+      return;
+    }
+
+    const track = state.searchTracks[Number(button.dataset.trackIndex)];
+    if (!track) {
+      return;
+    }
+
+    const queue = loadQueue();
+    const existing = queue.find((item) => item.uri === track.uri);
+
+    if (existing) {
+      // A música já está na fila: conta como mais um voto em vez de duplicar.
+      existing.votes = (existing.votes || 0) + 1;
+    } else {
+      if (queue.length >= MAX_QUEUE_ITEMS) {
+        window.alert(`A fila já tem o máximo de ${MAX_QUEUE_ITEMS} músicas.`);
+        return;
+      }
+
+      queue.push(
+        sanitizeQueueItem({
+          id: createItemId(track.uri),
+          uri: track.uri,
+          name: track.name,
+          artist: getArtistNames(track),
+          image: getTrackImage(track),
+          votes: 1,
+        })
+      );
+    }
+
+    saveQueue(queue);
+    renderQueue();
+    state.searchSequence += 1;
+    state.searchTracks = [];
+    collabSearchResults.innerHTML = "";
+    if (collabSearchInput) collabSearchInput.value = "";
+
+    if (existing) {
+      window.alert(`"${existing.name}" já estava na fila e ganhou mais um voto.`);
     }
   }
 
@@ -249,14 +295,27 @@ const CollabRoom = (() => {
       return;
     }
 
-    const user = getStoredUser();
-    if (!user || !user.id) {
+    if (!hasSession()) {
       window.alert("Faça login no Spotify para criar a playlist oficial.");
       return;
     }
 
+    const uris = [...new Set(queue.map((item) => item.uri).filter((uri) => TRACK_URI_PATTERN.test(uri)))];
+
+    if (!uris.length) {
+      window.alert("Nenhuma música com URI válida foi encontrada para criar a playlist.");
+      return;
+    }
+
+    if (saveQueueButton) {
+      saveQueueButton.disabled = true;
+    }
+
+    let playlist = null;
+
     try {
-      const playlist = await spotifyFetch(`https://api.spotify.com/v1/users/${user.id}/playlists`, {
+      // POST /me/playlists substitui POST /users/{id}/playlists (2026).
+      playlist = await spotifyFetch(`${API_BASE}/me/playlists`, {
         method: "POST",
         body: JSON.stringify({
           name: `Sala colaborativa ${new Date().toLocaleDateString("pt-BR")}`,
@@ -265,79 +324,135 @@ const CollabRoom = (() => {
         }),
       });
 
-      const uris = queue.map((item) => item.uri).filter(Boolean);
-
-      if (!uris.length) {
-        window.alert("Nenhuma música com URI válida foi encontrada para criar a playlist.");
-        return;
+      if (!playlist?.id) {
+        throw new Error("O Spotify não retornou a playlist criada.");
       }
 
-      await spotifyFetch(`https://api.spotify.com/v1/playlists/${playlist.id}/tracks`, {
-        method: "POST",
-        body: JSON.stringify({ uris }),
-      });
+      // POST /playlists/{id}/items aceita no máximo 100 URIs por requisição.
+      for (let index = 0; index < uris.length; index += 100) {
+        await spotifyFetch(`${API_BASE}/playlists/${encodeURIComponent(playlist.id)}/items`, {
+          method: "POST",
+          body: JSON.stringify({ uris: uris.slice(index, index + 100) }),
+        });
+      }
 
       window.alert(`Playlist criada com sucesso: ${playlist.name}`);
     } catch (error) {
-      if (error.message.includes("expirou") || error.message.includes("401")) {
-        window.alert("Sua sessão do Spotify expirou. Reconecte para criar a playlist.");
-        return;
+      const message = error.message || "Não foi possível criar a playlist.";
+      window.alert(
+        playlist?.id
+          ? `A playlist "${playlist.name}" foi criada, mas nem todas as músicas foram adicionadas. ${message}`
+          : message
+      );
+    } finally {
+      if (saveQueueButton) {
+        saveQueueButton.disabled = false;
       }
-
-      window.alert(error.message || "Não foi possível criar a playlist.");
+      if (playlist?.id) {
+        window.SpotifyPlaylists?.load?.();
+      }
     }
   }
 
   function exportRoomCode() {
     const queue = loadQueue();
+
+    if (!queue.length) {
+      window.alert("A fila está vazia. Adicione músicas antes de exportar o código.");
+      return;
+    }
+
     const payload = { queue };
     const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
 
     if (roomCodeBox) {
       roomCodeBox.value = encoded;
+      roomCodeBox.select();
     }
 
     window.alert("Código exportado. Copie e compartilhe com os amigos.");
   }
 
   function importRoomCode() {
-    const code = (roomCodeBox?.value || "").trim();
+    const code = (roomCodeBox?.value || "").replace(/\s+/g, "");
 
     if (!code) {
       window.alert("Cole um código da sala antes de importar.");
       return;
     }
 
+    let parsed = null;
+
     try {
       const decoded = decodeURIComponent(escape(atob(code)));
-      const parsed = JSON.parse(decoded);
-      const queue = Array.isArray(parsed.queue) ? parsed.queue : [];
-      saveQueue(queue);
-      renderQueue();
-      window.alert("Fila da sala importada com sucesso.");
+      parsed = JSON.parse(decoded);
     } catch (error) {
       window.alert("Código inválido. Verifique se o texto foi copiado corretamente.");
+      return;
     }
+
+    const rawQueue = Array.isArray(parsed?.queue) ? parsed.queue : null;
+
+    if (!rawQueue) {
+      window.alert("Código inválido. Verifique se o texto foi copiado corretamente.");
+      return;
+    }
+
+    const queue = sanitizeQueue(rawQueue);
+
+    if (rawQueue.length && !queue.length) {
+      window.alert("O código não contém nenhuma música válida do Spotify.");
+      return;
+    }
+
+    const currentQueue = loadQueue();
+    if (currentQueue.length) {
+      const confirmed = window.confirm("Importar este código vai substituir a fila atual. Deseja continuar?");
+      if (!confirmed) {
+        return;
+      }
+    }
+
+    saveQueue(queue);
+    renderQueue();
+
+    const ignored = rawQueue.length - queue.length;
+    window.alert(
+      ignored > 0
+        ? `Fila da sala importada com sucesso. ${ignored} item(ns) inválido(s) foram ignorados.`
+        : "Fila da sala importada com sucesso."
+    );
   }
 
   function attachEvents() {
     if (collabSearchInput) {
       collabSearchInput.addEventListener("input", (event) => {
-        searchTracksInRoom(event.target.value);
+        const value = event.target.value;
+        clearTimeout(state.searchTimer);
+        state.searchTimer = setTimeout(() => searchTracksInRoom(value), SEARCH_DEBOUNCE_MS);
       });
     }
 
-    if (saveQueueButton) {
-      saveQueueButton.addEventListener("click", createPlaylistFromQueue);
-    }
+    collabSearchResults?.addEventListener("click", handleSearchResultsClick);
+    collabQueue?.addEventListener("click", handleQueueClick);
+    saveQueueButton?.addEventListener("click", createPlaylistFromQueue);
+    exportCodeButton?.addEventListener("click", exportRoomCode);
+    importCodeButton?.addEventListener("click", importRoomCode);
 
-    if (exportCodeButton) {
-      exportCodeButton.addEventListener("click", exportRoomCode);
-    }
+    window.addEventListener("grooveflow:session-expired", () => {
+      state.searchSequence += 1;
+      state.searchTracks = [];
+      if (collabSearchResults) {
+        collabSearchResults.innerHTML = "";
+      }
+    });
 
-    if (importCodeButton) {
-      importCodeButton.addEventListener("click", importRoomCode);
-    }
+    // Mantém a fila sincronizada entre abas abertas no mesmo navegador.
+    window.addEventListener("storage", (event) => {
+      if (event.key === storageKey) {
+        renderQueue();
+      }
+    });
   }
 
   function init() {

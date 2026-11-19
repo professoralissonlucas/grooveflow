@@ -1,8 +1,14 @@
 // Este arquivo cuida da funcionalidade principal da aba "Minhas Playlists".
-// Ele usa a API do Spotify com autenticação JWT/Access Token já salva no localStorage.
-// Como o GitHub Pages não aceita back-end, a autenticação acontece no navegador.
+// Todas as chamadas passam por GrooveFlowAuth.spotifyFetch (auth.js), que cuida do
+// token, do refresh e das mensagens de erro. Endpoints conforme a Web API de 2026.
 
 const SpotifyPlaylists = (() => {
+  const API_BASE = "https://api.spotify.com/v1";
+  const DEFAULT_COVER = "linear-gradient(135deg, #1DB954, #3B82F6)";
+  const PLACEHOLDER_ART = "https://placehold.co/64x64/1DB954/111111?text=♪";
+  const SEARCH_DEBOUNCE_MS = 350;
+  const MAX_PAGES = 20;
+
   const playlistGrid = document.getElementById("playlist-grid");
   const openCreateButton = document.getElementById("open-create-playlist");
   const modal = document.getElementById("playlist-modal");
@@ -23,101 +29,85 @@ const SpotifyPlaylists = (() => {
 
   const state = {
     playlists: [],
+    loaded: false,
+    filterQuery: "",
     editingPlaylistId: null,
-    latestSearchQuery: "",
     currentTrackPlaylistId: null,
+    searchTimer: null,
+    searchSequence: 0,
+    lastSearchTracks: [],
   };
 
-  function getAccessToken() {
-    // Usa a API exposta por auth.js, quando disponível, para respeitar a expiração.
-    if (window.GrooveFlowAuth?.getAccessToken) {
-      return window.GrooveFlowAuth.getAccessToken();
-    }
+  const escapeHtml = (value) => window.GrooveFlowAuth.escapeHtml(value);
 
-    return localStorage.getItem("spotify_access_token");
+  function spotifyFetch(url, options = {}) {
+    return window.GrooveFlowAuth.spotifyFetch(url, options);
   }
 
-  function getStoredUser() {
-    const rawUser = localStorage.getItem("spotify_user");
-    if (!rawUser) {
-      return null;
-    }
-
-    try {
-      return JSON.parse(rawUser);
-    } catch (error) {
-      console.warn("Usuário salvo em formato inválido.", error);
-      return null;
-    }
+  function hasSession() {
+    return window.GrooveFlowAuth.hasSession();
   }
 
   function showToast(message) {
     window.alert(message);
   }
 
-  async function spotifyFetch(url, options = {}) {
-    // Usa os utilitários centralizados do auth.js para obter o token válido e tratar 401.
-    if (window.GrooveFlowAuth?.fetchSpotifyApi) {
-      return window.GrooveFlowAuth.fetchSpotifyApi(url, options);
+  function renderEmpty(container, message) {
+    if (container) {
+      container.innerHTML = `<div class="playlist-empty">${escapeHtml(message)}</div>`;
+    }
+  }
+
+  // Busca todas as páginas de um endpoint paginado do Spotify (seguindo "next").
+  async function fetchAllPages(firstUrl) {
+    const items = [];
+    let url = firstUrl;
+    let pages = 0;
+
+    while (url && pages < MAX_PAGES) {
+      const page = await spotifyFetch(url);
+      items.push(...(page?.items || []));
+      url = page?.next || null;
+      pages += 1;
     }
 
-    // Fallback para ambiente onde auth.js ainda não tenha sido carregado.
-    const token = getAccessToken();
+    return items;
+  }
 
-    if (!token) {
-      throw new Error("Você precisa estar logado no Spotify para usar esta funcionalidade.");
+  function getArtistNames(item) {
+    if (Array.isArray(item?.artists) && item.artists.length) {
+      return item.artists.map((artist) => artist.name).join(", ");
     }
 
-    const response = await fetch(url, {
-      ...options,
-      headers: {
-        Accept: "application/json",
-        ...(!options.method || options.method === "GET"
-          ? {}
-          : { "Content-Type": "application/json" }),
-        Authorization: `Bearer ${token}`,
-        ...(options.headers || {}),
-      },
-    });
+    // Episódios de podcast não têm "artists"; usamos o nome do programa.
+    return item?.show?.name || "";
+  }
 
-    if (response.status === 401) {
-      localStorage.removeItem("spotify_access_token");
-      localStorage.removeItem("spotify_user");
-      localStorage.removeItem("spotify_refresh_token");
-      localStorage.removeItem("spotify_token_expires_at");
-      window.dispatchEvent(new CustomEvent("grooveflow:session-expired"));
-      throw new Error("Sua sessão do Spotify expirou. Reconecte sua conta para continuar.");
-    }
+  // Só é possível adicionar itens em playlists próprias ou colaborativas.
+  function canModify(playlist) {
+    const user = window.GrooveFlowAuth.getUser();
+    return Boolean(playlist.collaborative || (user?.id && playlist.ownerId === user.id));
+  }
 
-    if (!response.ok) {
-      let details = "";
+  function getWritablePlaylists() {
+    return state.playlists.filter(canModify);
+  }
 
-      try {
-        const errorData = await response.json();
-        details = errorData?.error?.message || errorData?.error_description || "";
-      } catch (error) {
-        details = await response.text().catch(() => "");
-      }
-
-      const statusMessages = {
-        403: "Você não tem permissão para realizar esta operação.",
-        429: "Muitas solicitações foram enviadas. Aguarde alguns instantes.",
-      };
-
-      throw new Error(
-        details || statusMessages[response.status] || `A API do Spotify respondeu com o status ${response.status}.`
-      );
-    }
-
-    if (response.status === 204) {
-      return null;
-    }
-
-    return response.json();
+  function notifyPlaylistsUpdated() {
+    window.dispatchEvent(
+      new CustomEvent("grooveflow:playlists-updated", {
+        detail: { playlists: getWritablePlaylists() },
+      })
+    );
   }
 
   function openPlaylistModal(mode = "create", playlist = null) {
     if (!modal) {
+      return;
+    }
+
+    if (!hasSession()) {
+      showToast("Faça login no Spotify para criar ou editar playlists.");
       return;
     }
 
@@ -134,6 +124,7 @@ const SpotifyPlaylists = (() => {
     }
 
     modal.classList.remove("hidden");
+    playlistNameInput.focus();
   }
 
   function closePlaylistModal() {
@@ -153,7 +144,29 @@ const SpotifyPlaylists = (() => {
   }
 
   function formatPlaylistCount(quantity) {
-    return `${quantity} músicas`;
+    // Para playlists de terceiros a API de 2026 não informa o conteúdo.
+    return Number.isFinite(quantity) ? `${quantity} músicas` : "";
+  }
+
+  function getCoverStyle(playlist) {
+    if (!playlist.imageUrl) {
+      return `background: ${DEFAULT_COVER};`;
+    }
+
+    const safeUrl = playlist.imageUrl.replace(/["\\\n\r]/g, "");
+    return `background: url("${safeUrl}") center / cover no-repeat;`;
+  }
+
+  function getVisiblePlaylists() {
+    const query = state.filterQuery.toLowerCase();
+
+    if (!query) {
+      return state.playlists;
+    }
+
+    return state.playlists.filter((playlist) =>
+      `${playlist.name} ${playlist.description}`.toLowerCase().includes(query)
+    );
   }
 
   function renderPlaylistGrid() {
@@ -162,85 +175,95 @@ const SpotifyPlaylists = (() => {
     }
 
     if (!state.playlists.length) {
-      playlistGrid.innerHTML = `
-        <div class="playlist-empty">
-          Você ainda não tem playlists. Crie sua primeira coleção musical.
-        </div>
-      `;
+      renderEmpty(playlistGrid, "Você ainda não tem playlists. Crie sua primeira coleção musical.");
       return;
     }
 
-    playlistGrid.innerHTML = state.playlists
+    const visiblePlaylists = getVisiblePlaylists();
+
+    if (!visiblePlaylists.length) {
+      renderEmpty(playlistGrid, "Nenhuma playlist encontrada para a busca atual.");
+      return;
+    }
+
+    playlistGrid.innerHTML = visiblePlaylists
       .map(
         (playlist) => `
           <article class="playlist-card-item">
             <div
               class="playlist-card-cover"
-              style="background: ${playlist.image || "linear-gradient(135deg, #1DB954, #3B82F6)"};"
+              style="${escapeHtml(getCoverStyle(playlist))}"
             >
-              <span>${playlist.name}</span>
+              <span>${escapeHtml(playlist.name)}</span>
             </div>
             <div class="playlist-card-body">
-              <h3>${playlist.name}</h3>
-              <p>${playlist.description || "Sem descrição"}</p>
-              <p>${formatPlaylistCount(playlist.tracks.total)}</p>
+              <h3>${escapeHtml(playlist.name)}</h3>
+              <p>${escapeHtml(playlist.description || "Sem descrição")}</p>
+              <p>${escapeHtml(formatPlaylistCount(playlist.total))}</p>
             </div>
             <div class="playlist-card-actions">
-              <button class="icon-btn" type="button" data-action="edit" data-id="${playlist.id}">Editar</button>
-              <button class="icon-btn" type="button" data-action="manage-tracks" data-id="${playlist.id}">Músicas</button>
-              <button class="icon-btn" type="button" data-action="delete" data-id="${playlist.id}">Excluir</button>
+              <button class="icon-btn" type="button" data-action="edit" data-id="${escapeHtml(playlist.id)}">Editar</button>
+              <button class="icon-btn" type="button" data-action="manage-tracks" data-id="${escapeHtml(playlist.id)}">Músicas</button>
+              <button class="icon-btn" type="button" data-action="delete" data-id="${escapeHtml(playlist.id)}">Excluir</button>
             </div>
           </article>
         `
       )
       .join("");
+  }
 
-    playlistGrid.querySelectorAll("[data-action='edit']").forEach((button) => {
-      button.addEventListener("click", async () => {
-        const playlist = state.playlists.find((item) => item.id === button.dataset.id);
-        if (playlist) {
-          openPlaylistModal("edit", playlist);
-        }
+  // Um único listener na grade trata os botões de todos os cards.
+  async function handleGridClick(event) {
+    const button = event.target.closest("button[data-action]");
+    if (!button || !playlistGrid.contains(button)) {
+      return;
+    }
+
+    const playlist = state.playlists.find((item) => item.id === button.dataset.id);
+    if (!playlist) {
+      return;
+    }
+
+    if (button.dataset.action === "edit") {
+      if (!canModify(playlist)) {
+        showToast("Só é possível editar playlists criadas por você.");
+        return;
+      }
+      openPlaylistModal("edit", playlist);
+      return;
+    }
+
+    if (button.dataset.action === "manage-tracks") {
+      openTrackManager(playlist);
+      return;
+    }
+
+    if (button.dataset.action === "delete") {
+      await unfollowPlaylist(playlist, button);
+    }
+  }
+
+  async function unfollowPlaylist(playlist, button) {
+    const confirmed = window.confirm(`Deseja deixar de seguir a playlist "${playlist.name}"?`);
+
+    if (!confirmed) {
+      return;
+    }
+
+    button.disabled = true;
+
+    try {
+      // DELETE /me/library substitui DELETE /playlists/{id}/followers (2026).
+      const uri = `spotify:playlist:${playlist.id}`;
+      await spotifyFetch(`${API_BASE}/me/library?uris=${encodeURIComponent(uri)}`, {
+        method: "DELETE",
       });
-    });
-
-    playlistGrid.querySelectorAll("[data-action='manage-tracks']").forEach((button) => {
-      button.addEventListener("click", async () => {
-        const playlist = state.playlists.find((item) => item.id === button.dataset.id);
-        if (playlist) {
-          openTrackManager(playlist);
-        }
-      });
-    });
-
-    playlistGrid.querySelectorAll("[data-action='delete']").forEach((button) => {
-      button.addEventListener("click", async () => {
-        const playlistId = button.dataset.id;
-        const playlist = state.playlists.find((item) => item.id === playlistId);
-
-        if (!playlist) {
-          return;
-        }
-
-        const confirmed = window.confirm(
-          `Deseja deixar de seguir a playlist "${playlist.name}"?`
-        );
-
-        if (!confirmed) {
-          return;
-        }
-
-        try {
-          await spotifyFetch(`https://api.spotify.com/v1/playlists/${playlistId}/followers`, {
-            method: "DELETE",
-          });
-          await loadUserPlaylists();
-          showToast("Playlist removida com sucesso.");
-        } catch (error) {
-          showToast(error.message || "Não foi possível remover a playlist.");
-        }
-      });
-    });
+      await loadUserPlaylists();
+      showToast("Playlist removida com sucesso.");
+    } catch (error) {
+      button.disabled = false;
+      showToast(error.message || "Não foi possível remover a playlist.");
+    }
   }
 
   function openTrackManager(playlist) {
@@ -251,7 +274,7 @@ const SpotifyPlaylists = (() => {
     state.currentTrackPlaylistId = playlist.id;
     tracksModalTitle.textContent = `Músicas de ${playlist.name}`;
     tracksModal.classList.remove("hidden");
-    playlistTrackList.innerHTML = '<div class="playlist-empty">Carregando músicas...</div>';
+    renderEmpty(playlistTrackList, "Carregando músicas...");
 
     loadTracksForPlaylist(playlist.id);
   }
@@ -262,151 +285,139 @@ const SpotifyPlaylists = (() => {
     }
 
     try {
-      const result = await spotifyFetch(
-        `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=50`
-      );
+      // GET /playlists/{id}/items substitui /tracks; cada entrada traz o conteúdo em "item".
+      const entries = await fetchAllPages(`${API_BASE}/playlists/${encodeURIComponent(playlistId)}/items?limit=50`);
 
-      const items = result.items || [];
-
-      if (!items.length) {
-        playlistTrackList.innerHTML = '<div class="playlist-empty">Esta playlist ainda não tem músicas.</div>';
+      if (state.currentTrackPlaylistId !== playlistId) {
         return;
       }
 
-      playlistTrackList.innerHTML = items
-        .map((item) => {
-          const track = item.track;
-          if (!track) {
-            return "";
-          }
+      const tracks = entries.map((entry) => entry.item || entry.track).filter((item) => item && item.uri);
 
-          return `
+      if (!tracks.length) {
+        renderEmpty(playlistTrackList, "Esta playlist ainda não tem músicas.");
+        return;
+      }
+
+      playlistTrackList.innerHTML = tracks
+        .map(
+          (track) => `
             <div class="playlist-track-item">
               <div>
-                <strong>${track.name}</strong>
-                <span>${track.artists.map((artist) => artist.name).join(", ")}</span>
+                <strong>${escapeHtml(track.name)}</strong>
+                <span>${escapeHtml(getArtistNames(track))}</span>
               </div>
               <button
                 class="track-remove-btn"
                 type="button"
-                data-track-uri="${track.uri}"
-                data-track-name="${track.name}"
+                data-track-uri="${escapeHtml(track.uri)}"
+                data-track-name="${escapeHtml(track.name)}"
               >
                 Remover
               </button>
             </div>
-          `;
-        })
+          `
+        )
         .join("");
-
-      playlistTrackList.querySelectorAll(".track-remove-btn").forEach((button) => {
-        button.addEventListener("click", async () => {
-          const trackUri = button.dataset.trackUri;
-          const confirmed = window.confirm(`Remover a música "${button.dataset.trackName}" desta playlist?`);
-
-          if (!confirmed) {
-            return;
-          }
-
-          try {
-            await spotifyFetch(`https://api.spotify.com/v1/playlists/${playlistId}/tracks`, {
-              method: "DELETE",
-              body: JSON.stringify({
-                tracks: [{ uri: trackUri }],
-              }),
-            });
-            await loadTracksForPlaylist(playlistId);
-            await loadUserPlaylists();
-            showToast("Música removida da playlist.");
-          } catch (error) {
-            showToast(error.message || "Não foi possível remover a música.");
-          }
-        });
-      });
     } catch (error) {
-      playlistTrackList.innerHTML = `<div class="playlist-empty">${error.message || "Não foi possível carregar as músicas."}</div>`;
+      if (state.currentTrackPlaylistId === playlistId) {
+        renderEmpty(playlistTrackList, error.message || "Não foi possível carregar as músicas.");
+      }
     }
   }
 
+  async function handleTrackListClick(event) {
+    const button = event.target.closest(".track-remove-btn");
+    const playlistId = state.currentTrackPlaylistId;
+
+    if (!button || !playlistId) {
+      return;
+    }
+
+    const confirmed = window.confirm(`Remover a música "${button.dataset.trackName}" desta playlist?`);
+    if (!confirmed) {
+      return;
+    }
+
+    button.disabled = true;
+
+    try {
+      await removeTrackFromPlaylist(playlistId, button.dataset.trackUri);
+      await loadTracksForPlaylist(playlistId);
+      showToast("Música removida da playlist.");
+    } catch (error) {
+      button.disabled = false;
+      showToast(error.message || "Não foi possível remover a música.");
+    }
+  }
+
+  async function removeTrackFromPlaylist(playlistId, trackUri) {
+    // DELETE /playlists/{id}/items com o parâmetro "items" (antes "tracks").
+    await spotifyFetch(`${API_BASE}/playlists/${encodeURIComponent(playlistId)}/items`, {
+      method: "DELETE",
+      body: JSON.stringify({ items: [{ uri: trackUri }] }),
+    });
+    await loadUserPlaylists();
+  }
+
+  async function addTracksToPlaylist(playlistId, uris) {
+    // POST /playlists/{id}/items aceita no máximo 100 URIs por requisição.
+    for (let index = 0; index < uris.length; index += 100) {
+      await spotifyFetch(`${API_BASE}/playlists/${encodeURIComponent(playlistId)}/items`, {
+        method: "POST",
+        body: JSON.stringify({ uris: uris.slice(index, index + 100) }),
+      });
+    }
+  }
+
+  function mapPlaylist(playlist) {
+    // Em 2026 o campo "tracks" do objeto playlist virou "items".
+    const content = playlist.items || playlist.tracks;
+
+    return {
+      id: playlist.id,
+      name: playlist.name || "Playlist sem nome",
+      description: playlist.description || "",
+      public: playlist.public,
+      collaborative: Boolean(playlist.collaborative),
+      ownerId: playlist.owner?.id || null,
+      total: typeof content?.total === "number" ? content.total : null,
+      imageUrl: playlist.images && playlist.images.length > 0 ? playlist.images[0].url : null,
+    };
+  }
+
   async function loadUserPlaylists() {
-    if (!getAccessToken()) {
-      state.playlists = [];
-      renderPlaylistGrid();
+    if (!hasSession()) {
+      resetSessionState();
       return;
     }
 
     try {
       // GET /v1/me/playlists: lista as playlists associadas ao usuário autenticado.
-      const result = await spotifyFetch("https://api.spotify.com/v1/me/playlists?limit=20&offset=0");
-
-      state.playlists = (result.items || []).map((playlist) => ({
-        id: playlist.id,
-        name: playlist.name,
-        description: playlist.description,
-        public: playlist.public,
-        tracks: playlist.tracks,
-        image:
-          playlist.images && playlist.images.length > 0
-            ? playlist.images[0].url
-            : "linear-gradient(135deg, #1DB954, #3B82F6)",
-      }));
-
+      const items = await fetchAllPages(`${API_BASE}/me/playlists?limit=50&offset=0`);
+      state.playlists = items.filter(Boolean).map(mapPlaylist);
+      state.loaded = true;
       renderPlaylistGrid();
+      refreshSearchSelects();
+      notifyPlaylistsUpdated();
     } catch (error) {
       console.error("Erro ao listar playlists:", error);
-      playlistGrid.innerHTML = `<div class="playlist-empty">${error.message || "Não foi possível carregar as playlists."}</div>`;
+      if (hasSession()) {
+        renderEmpty(playlistGrid, error.message || "Não foi possível carregar as playlists.");
+      }
     }
   }
 
   async function createPlaylist(playlistName, playlistDescription, isPublic = true) {
-    try {
-      const token = await GrooveFlowAuth.getValidAccessToken();
-      if (!token) {
-        throw new Error("Usuário não autenticado. Faça login no Spotify.");
-      }
-
-      const user = GrooveFlowAuth.getUser();
-      if (!user?.id) {
-        throw new Error("Usuário não identificado. Faça login novamente.");
-      }
-
-      const response = await fetch(
-        `https://api.spotify.com/v1/users/${encodeURIComponent(user.id)}/playlists`,
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            name: playlistName,
-            description: playlistDescription,
-            public: isPublic,
-          }),
-        }
-      );
-
-      if (response.status === 401) {
-        await GrooveFlowAuth.handleSpotifyUnauthorized(false);
-        throw new Error("Sua sessão expirou. Faça login novamente.");
-      }
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(
-          errorData.error?.message || `Erro ao criar playlist: ${response.status}`
-        );
-      }
-
-      const newPlaylist = await response.json();
-      console.log("Playlist criada com sucesso:", newPlaylist);
-      alert(`Playlist "${newPlaylist.name}" criada com sucesso!`);
-      return newPlaylist;
-    } catch (error) {
-      console.error("Erro na criação da playlist:", error);
-      alert(error.message);
-      return null;
-    }
+    // POST /v1/me/playlists substitui POST /users/{id}/playlists (2026).
+    return spotifyFetch(`${API_BASE}/me/playlists`, {
+      method: "POST",
+      body: JSON.stringify({
+        name: playlistName,
+        description: playlistDescription,
+        public: isPublic,
+      }),
+    });
   }
 
   async function handleCreateOrUpdatePlaylist(event) {
@@ -421,9 +432,14 @@ const SpotifyPlaylists = (() => {
       return;
     }
 
+    const submitButton = playlistForm.querySelector("button[type='submit']");
+    if (submitButton) {
+      submitButton.disabled = true;
+    }
+
     try {
       if (state.editingPlaylistId) {
-        await spotifyFetch(`https://api.spotify.com/v1/playlists/${state.editingPlaylistId}`, {
+        await spotifyFetch(`${API_BASE}/playlists/${encodeURIComponent(state.editingPlaylistId)}`, {
           method: "PUT",
           body: JSON.stringify({
             name,
@@ -431,34 +447,59 @@ const SpotifyPlaylists = (() => {
             public: isPublic,
           }),
         });
+        closePlaylistModal();
         showToast("Playlist atualizada com sucesso.");
       } else {
         const createdPlaylist = await createPlaylist(name, description, isPublic);
-        if (!createdPlaylist) {
-          return;
-        }
+        closePlaylistModal();
+        showToast(`Playlist "${createdPlaylist?.name || name}" criada com sucesso!`);
       }
 
       await loadUserPlaylists();
-      closePlaylistModal();
     } catch (error) {
       showToast(error.message || "Não foi possível salvar a playlist.");
+    } finally {
+      if (submitButton) {
+        submitButton.disabled = false;
+      }
     }
   }
 
-  async function removeTrackFromPlaylist(playlistId, trackUri) {
-    try {
-      await spotifyFetch(`https://api.spotify.com/v1/playlists/${playlistId}/tracks`, {
-        method: "DELETE",
-        body: JSON.stringify({
-          tracks: [{ uri: trackUri }],
-        }),
-      });
-      await loadUserPlaylists();
-      showToast("Música removida da playlist.");
-    } catch (error) {
-      showToast(error.message || "Não foi possível remover a música.");
+  function getPlaylistOptionsHtml() {
+    const writable = getWritablePlaylists();
+
+    if (!writable.length) {
+      return '<option value="">Crie uma playlist primeiro</option>';
     }
+
+    return writable
+      .map((playlist) => `<option value="${escapeHtml(playlist.id)}">${escapeHtml(playlist.name)}</option>`)
+      .join("");
+  }
+
+  // Atualiza apenas as opções dos selects, sem recriar os resultados (não interrompe previews).
+  function refreshSearchSelects() {
+    if (!searchResults) {
+      return;
+    }
+
+    const optionsHtml = getPlaylistOptionsHtml();
+    searchResults.querySelectorAll(".search-result-actions select").forEach((select) => {
+      const previousValue = select.value;
+      select.innerHTML = optionsHtml;
+      if ([...select.options].some((option) => option.value === previousValue)) {
+        select.value = previousValue;
+      }
+    });
+  }
+
+  function renderPreviewOrLink(track) {
+    if (track.preview_url) {
+      return `<audio controls preload="none"><source src="${escapeHtml(track.preview_url)}" type="audio/mpeg" /></audio>`;
+    }
+
+    const href = track.external_urls?.spotify || `https://open.spotify.com/track/${track.id}`;
+    return `<a class="spotify-link" href="${escapeHtml(href)}" target="_blank" rel="noreferrer">Abrir no Spotify</a>`;
   }
 
   function renderSearchResults(results) {
@@ -466,98 +507,122 @@ const SpotifyPlaylists = (() => {
       return;
     }
 
+    state.lastSearchTracks = results;
+
     if (!results.length) {
-      searchResults.innerHTML = `
-        <div class="playlist-empty">
-          Nenhuma música encontrada para a busca atual.
-        </div>
-      `;
+      renderEmpty(searchResults, "Nenhuma música encontrada para a busca atual.");
       return;
     }
 
-    const playlistOptions = state.playlists.length
-      ? state.playlists
-          .map(
-            (playlist) =>
-              `<option value="${playlist.id}">${playlist.name}</option>`
-          )
-          .join("")
-      : '<option value="">Crie uma playlist primeiro</option>';
+    const playlistOptions = getPlaylistOptionsHtml();
 
     searchResults.innerHTML = results
       .map(
-        (track) => `
+        (track, index) => `
           <article class="search-result-item">
             <img
               class="search-result-art"
-              src="${track.album?.images?.[2]?.url || "https://placehold.co/64x64/1DB954/111111?text=♪"}"
-              alt="Capa do álbum ${track.album?.name || "álbum"}"
+              src="${escapeHtml(track.album?.images?.[2]?.url || track.album?.images?.[0]?.url || PLACEHOLDER_ART)}"
+              alt="Capa do álbum ${escapeHtml(track.album?.name || "álbum")}"
             />
             <div class="search-result-meta">
-              <strong>${track.name}</strong>
-              <span>${track.artists.map((artist) => artist.name).join(", ")}</span>
+              <strong>${escapeHtml(track.name)}</strong>
+              <span>${escapeHtml(getArtistNames(track))}</span>
             </div>
             <div class="search-result-actions">
-              ${
-                track.preview_url
-                  ? `<audio controls preload="none"><source src="${track.preview_url}" type="audio/mpeg" /></audio>`
-                  : `<a class="spotify-link" href="${track.external_urls?.spotify || "#"}" target="_blank" rel="noreferrer">Abrir no Spotify</a>`
-              }
-              <select data-track-uri="${track.uri}" data-track-name="${track.name}">
+              ${renderPreviewOrLink(track)}
+              <select data-track-index="${index}" aria-label="Playlist de destino">
                 ${playlistOptions}
               </select>
-              <button type="button" data-action="add-track" data-track-uri="${track.uri}" data-track-name="${track.name}">Adicionar</button>
+              <button type="button" data-action="add-track" data-track-index="${index}">Adicionar</button>
             </div>
           </article>
         `
       )
       .join("");
-
-    searchResults.querySelectorAll("[data-action='add-track']").forEach((button) => {
-      button.addEventListener("click", async () => {
-        const playlistId = button.parentElement.querySelector("select").value;
-        const trackUri = button.dataset.trackUri;
-
-        if (!playlistId) {
-          showToast("Crie uma playlist antes de adicionar músicas.");
-          return;
-        }
-
-        try {
-          await spotifyFetch(`https://api.spotify.com/v1/playlists/${playlistId}/tracks`, {
-            method: "POST",
-            body: JSON.stringify({ uris: [trackUri] }),
-          });
-          showToast(`Música adicionada à playlist selecionada.`);
-          await loadUserPlaylists();
-        } catch (error) {
-          showToast(error.message || "Não foi possível adicionar a música.");
-        }
-      });
-    });
   }
 
-  async function handleTrackSearch() {
-    const query = trackSearchInput.value.trim();
-    state.latestSearchQuery = query;
+  async function handleSearchResultsClick(event) {
+    const button = event.target.closest("[data-action='add-track']");
+    if (!button) {
+      return;
+    }
+
+    const track = state.lastSearchTracks[Number(button.dataset.trackIndex)];
+    const playlistId = button.parentElement.querySelector("select")?.value;
+
+    if (!track) {
+      return;
+    }
+
+    if (!playlistId) {
+      showToast("Crie uma playlist antes de adicionar músicas.");
+      return;
+    }
+
+    button.disabled = true;
+
+    try {
+      await addTracksToPlaylist(playlistId, [track.uri]);
+      const playlist = state.playlists.find((item) => item.id === playlistId);
+      showToast(`Música adicionada à playlist ${playlist ? `"${playlist.name}"` : "selecionada"}.`);
+      await loadUserPlaylists();
+    } catch (error) {
+      showToast(error.message || "Não foi possível adicionar a música.");
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function runTrackSearch(query) {
+    const sequence = ++state.searchSequence;
 
     if (!query) {
+      state.lastSearchTracks = [];
       searchResults.innerHTML = "";
       return;
     }
 
-    try {
-      const endpoint = `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track&limit=10&market=BR`;
-      const result = await spotifyFetch(endpoint);
-      const tracks = result.tracks?.items || [];
-      renderSearchResults(tracks);
-    } catch (error) {
-      searchResults.innerHTML = `
-        <div class="playlist-empty">
-          ${error.message || "Não foi possível realizar a busca."}
-        </div>
-      `;
+    if (!hasSession()) {
+      renderEmpty(searchResults, "Conecte-se para buscar músicas e adicionar à sua biblioteca.");
+      return;
     }
+
+    try {
+      // A busca aceita no máximo limit=10 em 2026.
+      const endpoint = `${API_BASE}/search?q=${encodeURIComponent(query)}&type=track&limit=10&offset=0&market=BR`;
+      const result = await spotifyFetch(endpoint);
+
+      // Descarta respostas de buscas antigas que chegaram depois da mais recente.
+      if (sequence !== state.searchSequence) {
+        return;
+      }
+
+      renderSearchResults((result?.tracks?.items || []).filter(Boolean));
+    } catch (error) {
+      if (sequence === state.searchSequence) {
+        renderEmpty(searchResults, error.message || "Não foi possível realizar a busca.");
+      }
+    }
+  }
+
+  function handleTrackSearch() {
+    const query = trackSearchInput.value.trim();
+    clearTimeout(state.searchTimer);
+    state.searchTimer = setTimeout(() => runTrackSearch(query), SEARCH_DEBOUNCE_MS);
+  }
+
+  // Filtro local da grade de playlists (usado pela busca do topo).
+  function filterPlaylists(query) {
+    state.filterQuery = (query || "").trim();
+    if (state.loaded) {
+      renderPlaylistGrid();
+    }
+  }
+
+  function renderLoggedOutMessages() {
+    renderEmpty(playlistGrid, "Faça login no Spotify para ver e gerenciar suas playlists.");
+    renderEmpty(searchResults, "Conecte-se para buscar músicas e adicionar à sua biblioteca.");
   }
 
   async function initPlaylistFeatures() {
@@ -572,47 +637,211 @@ const SpotifyPlaylists = (() => {
     cancelTracksModalButton.addEventListener("click", closeTracksModal);
     playlistForm.addEventListener("submit", handleCreateOrUpdatePlaylist);
     trackSearchInput.addEventListener("input", handleTrackSearch);
+    playlistGrid.addEventListener("click", handleGridClick);
+    searchResults.addEventListener("click", handleSearchResultsClick);
+    playlistTrackList?.addEventListener("click", handleTrackListClick);
 
-    if (!getAccessToken()) {
-      playlistGrid.innerHTML = `
-        <div class="playlist-empty">
-          Faça login no Spotify para ver e gerenciar suas playlists.
-        </div>
-      `;
-      searchResults.innerHTML = `
-        <div class="playlist-empty">
-          Conecte-se para buscar músicas e adicionar à sua biblioteca.
-        </div>
-      `;
-      return;
+    // Fecha os modais com Esc ou clicando fora do cartão.
+    [modal, tracksModal].forEach((overlay) => {
+      overlay?.addEventListener("click", (event) => {
+        if (event.target === overlay) {
+          overlay === modal ? closePlaylistModal() : closeTracksModal();
+        }
+      });
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") {
+        return;
+      }
+      if (modal && !modal.classList.contains("hidden")) {
+        closePlaylistModal();
+      }
+      if (tracksModal && !tracksModal.classList.contains("hidden")) {
+        closeTracksModal();
+      }
+    });
+
+    if (!hasSession()) {
+      renderLoggedOutMessages();
+    } else {
+      renderEmpty(playlistGrid, "Carregando suas playlists...");
     }
 
-    await loadUserPlaylists();
+    const loggedIn = await window.GrooveFlowAuth.whenReady();
+
+    if (loggedIn) {
+      await loadUserPlaylists();
+    } else {
+      renderLoggedOutMessages();
+    }
   }
 
   function resetSessionState() {
     state.playlists = [];
-
-    if (playlistGrid) {
-      playlistGrid.innerHTML = '<div class="playlist-empty">Faça login no Spotify para ver e gerenciar suas playlists.</div>';
+    state.loaded = false;
+    state.lastSearchTracks = [];
+    state.searchSequence += 1;
+    closeTracksModal();
+    if (modal && !modal.classList.contains("hidden")) {
+      closePlaylistModal();
     }
-
-    if (searchResults) {
-      searchResults.innerHTML = '<div class="playlist-empty">Conecte-se novamente para buscar músicas.</div>';
-    }
+    renderEmpty(playlistGrid, "Faça login no Spotify para ver e gerenciar suas playlists.");
+    renderEmpty(searchResults, "Conecte-se novamente para buscar músicas.");
+    notifyPlaylistsUpdated();
   }
 
   return {
     init: initPlaylistFeatures,
     load: loadUserPlaylists,
     search: handleTrackSearch,
+    filterPlaylists,
     resetSessionState,
     createPlaylist,
+    addTracksToPlaylist,
+    getWritablePlaylists,
+    isLoaded: () => state.loaded,
   };
+})();
+
+// Exposto para discover.js e collab.js (const no topo do script não vira propriedade de window).
+window.SpotifyPlaylists = SpotifyPlaylists;
+
+// Navegação da barra lateral e busca global do topo.
+// Usa apenas elementos e classes que já existem no index.html (sem ids novos).
+const GrooveFlowNavigation = (() => {
+  const SCROLL_LOCK_MS = 900;
+  let scrollLockUntil = 0;
+  let topSearchTimer = null;
+
+  function getNavButtons() {
+    return [...document.querySelectorAll(".nav-menu .nav-item")];
+  }
+
+  // Ordem dos botões no HTML: Minhas Playlists, Sala com Amigos, Descobrir Músicas.
+  function getTargets() {
+    return [
+      document.getElementById("playlist-grid")?.closest("section"),
+      document.querySelector(".collab-section"),
+      document.getElementById("discover-vibes")?.closest("section"),
+    ];
+  }
+
+  function setActive(index) {
+    getNavButtons().forEach((button, buttonIndex) => {
+      const isActive = buttonIndex === index;
+      button.classList.toggle("active", isActive);
+      if (isActive) {
+        button.setAttribute("aria-current", "true");
+      } else {
+        button.removeAttribute("aria-current");
+      }
+    });
+  }
+
+  function initNavigation() {
+    const buttons = getNavButtons();
+    const targets = getTargets();
+
+    buttons.forEach((button, index) => {
+      button.addEventListener("click", () => {
+        const target = targets[index];
+        if (!target) {
+          return;
+        }
+        scrollLockUntil = Date.now() + SCROLL_LOCK_MS;
+        setActive(index);
+        target.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+    });
+
+    if (!("IntersectionObserver" in window)) {
+      return;
+    }
+
+    // Atualiza o item ativo conforme a rolagem. A seção "Procurar músicas" conta como Playlists.
+    const searchSection = document.querySelector(".search-section");
+    const tracked = [
+      { element: targets[0], index: 0 },
+      { element: searchSection, index: 0 },
+      { element: targets[2], index: 2 },
+      { element: targets[1], index: 1 },
+    ].filter((entry) => entry.element);
+    const visibility = new Map();
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => visibility.set(entry.target, entry.intersectionRatio));
+
+        if (Date.now() < scrollLockUntil) {
+          return;
+        }
+
+        let best = null;
+        tracked.forEach((item) => {
+          const ratio = visibility.get(item.element) || 0;
+          if (ratio > 0 && (!best || ratio > best.ratio)) {
+            best = { index: item.index, ratio };
+          }
+        });
+
+        if (best) {
+          setActive(best.index);
+        }
+      },
+      { threshold: [0, 0.25, 0.5, 0.75, 1] }
+    );
+
+    tracked.forEach((item) => observer.observe(item.element));
+  }
+
+  function initTopSearch() {
+    const topSearchInput = document.querySelector(".topbar .search-box input[type='search']");
+    const trackSearchInput = document.getElementById("track-search-input");
+
+    if (!topSearchInput) {
+      return;
+    }
+
+    topSearchInput.addEventListener("input", () => {
+      clearTimeout(topSearchTimer);
+      topSearchTimer = setTimeout(() => {
+        const value = topSearchInput.value.trim();
+        SpotifyPlaylists.filterPlaylists(value);
+
+        // Também busca músicas e artistas na seção "Procurar músicas".
+        if (trackSearchInput && trackSearchInput.value.trim() !== value) {
+          trackSearchInput.value = value;
+          SpotifyPlaylists.search();
+        }
+      }, 250);
+    });
+
+    topSearchInput.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") {
+        return;
+      }
+      event.preventDefault();
+      const target = getTargets()[0];
+      if (target) {
+        scrollLockUntil = Date.now() + SCROLL_LOCK_MS;
+        setActive(0);
+        target.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    });
+  }
+
+  function init() {
+    initNavigation();
+    initTopSearch();
+  }
+
+  return { init };
 })();
 
 window.addEventListener("DOMContentLoaded", () => {
   SpotifyPlaylists.init();
+  GrooveFlowNavigation.init();
 });
 
 window.addEventListener("grooveflow:session-expired", () => {

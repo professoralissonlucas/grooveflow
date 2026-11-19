@@ -1,41 +1,123 @@
-// Configuração principal do Spotify.
-// Para forçar uma URI exata, preencha SPOTIFY_REDIRECT_URI.
-// Caso fique vazia, o projeto usa a URL atual normalizada para index.html.
-const SPOTIFY_CLIENT_ID = "8dce9fc0d3f041a19ffcc17ba2496185";
-const SPOTIFY_REDIRECT_URI = "";
+// =============================================================================
+// GrooveFlow — Autenticação com o Spotify (Authorization Code + PKCE)
+// Sem Client Secret: todo o fluxo roda no navegador (GitHub Pages / http.server).
+// =============================================================================
 
+// Client ID do app criado no Spotify Developer Dashboard (https://developer.spotify.com/dashboard).
+// Ele é público por natureza no fluxo PKCE; NUNCA coloque o Client Secret neste arquivo.
+const SPOTIFY_CLIENT_ID = "3b3f404ae17d4dbb87d61c8b484ad702";
+
+// O Spotify não aceita "localhost" como Redirect URI (apenas o loopback 127.0.0.1).
+// Se a página for aberta via localhost, redirecionamos para 127.0.0.1 antes de tudo.
+const IS_REDIRECTING_TO_LOOPBACK = window.location.hostname === "localhost";
+if (IS_REDIRECTING_TO_LOOPBACK) {
+  const loopbackUrl = new URL(window.location.href);
+  loopbackUrl.hostname = "127.0.0.1";
+  window.location.replace(loopbackUrl.toString());
+}
+
+// Redirect URI calculada pelo endereço atual: origin + pathname, sem query string nem hash.
+// Assim funciona em http://127.0.0.1:8000/index.html e no GitHub Pages sem editar código.
+// Única normalização: caminho terminado em "/" vira ".../index.html", para coincidir com
+// a URI cadastrada no Dashboard mesmo quando o usuário abre a pasta raiz.
 function getRedirectUri() {
-  if (SPOTIFY_REDIRECT_URI.trim()) {
-    return SPOTIFY_REDIRECT_URI.trim();
-  }
-
   let path = window.location.pathname;
 
   if (path.endsWith("/")) {
     path += "index.html";
-  } else if (!/[.]html?$/.test(path)) {
-    path = `${path}/index.html`;
   }
 
   return `${window.location.origin}${path}`;
 }
 
-// Calculada uma única vez e compartilhada por todo o fluxo OAuth.
 const REDIRECT_URI = getRedirectUri();
+
 const SPOTIFY_SCOPES = [
   "playlist-read-private",
+  "playlist-read-collaborative",
   "playlist-modify-public",
   "playlist-modify-private",
   "user-read-private",
 ].join(" ");
 
-const TOKEN_STORAGE_KEY = "spotify_access_token";
-const USER_STORAGE_KEY = "spotify_user";
-const CODE_VERIFIER_KEY = "spotify_code_verifier";
-const OAUTH_STATE_KEY = "spotify_oauth_state";
+const SPOTIFY_AUTHORIZE_URL = "https://accounts.spotify.com/authorize";
+const SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token";
+const SPOTIFY_API_BASE = "https://api.spotify.com/v1";
 
+// Chaves de armazenamento (conforme spec.md).
+const TOKEN_STORAGE_KEY = "spotify_access_token";
+const REFRESH_TOKEN_KEY = "spotify_refresh_token";
+const TOKEN_EXPIRES_AT_KEY = "spotify_token_expires_at";
+const USER_STORAGE_KEY = "spotify_user";
+const CODE_VERIFIER_KEY = "spotify_code_verifier"; // sessionStorage
+const OAUTH_STATE_KEY = "spotify_oauth_state"; // sessionStorage
+
+// Renova o token este tempo antes de ele expirar.
+const REFRESH_MARGIN_MS = 60 * 1000;
+
+// Tentativas extras quando o Spotify responde 429 (limite de requisições).
+const MAX_RATE_LIMIT_RETRIES = 3;
+const MAX_RATE_LIMIT_WAIT_SECONDS = 30;
+
+const SESSION_EXPIRED_MESSAGE = "Sua sessão do Spotify expirou. Clique em \"Conectar com Spotify\" para entrar novamente.";
+const LOGIN_REQUIRED_MESSAGE = "Faça login no Spotify para continuar.";
+const FORBIDDEN_MESSAGE =
+  "O Spotify negou o acesso (403). Verifique se a sua conta do Spotify está cadastrada em " +
+  "\"User Management\" no app do Spotify Developer Dashboard (apps em Development Mode só " +
+  "aceitam usuários cadastrados) ou se você tem permissão para esta operação — por exemplo, " +
+  "só é possível alterar playlists criadas por você ou em que você colabora.";
+
+// Estados de sessão do spec.
+const SESSION_STATES = Object.freeze({
+  LOGGED_OUT: "desconectado",
+  LOGGED_IN: "conectado",
+  EXPIRED: "expirada",
+});
+
+let sessionState = SESSION_STATES.LOGGED_OUT;
 let spotifyConnectButton = null;
 let spotifyUserPanel = null;
+let refreshPromise = null;
+let refreshTimer = null;
+
+// Promessa resolvida quando a inicialização da autenticação termina.
+// Os outros módulos esperam por ela antes de chamar a API.
+let resolveAuthReady = null;
+const authReady = new Promise((resolve) => {
+  resolveAuthReady = resolve;
+});
+
+// -----------------------------------------------------------------------------
+// Utilitários
+// -----------------------------------------------------------------------------
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function createApiError(message, status) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+function handleSpotifyError(message) {
+  console.error(message);
+  window.alert(message);
+}
+
+function isSpotifyConfigured() {
+  return Boolean(SPOTIFY_CLIENT_ID) && !SPOTIFY_CLIENT_ID.includes("SEU_CLIENT_ID_AQUI");
+}
 
 function getAuthElements() {
   spotifyConnectButton = document.getElementById("spotify-connect-btn") || spotifyConnectButton;
@@ -43,26 +125,15 @@ function getAuthElements() {
   return Boolean(spotifyConnectButton && spotifyUserPanel);
 }
 
-function isSpotifyConfigured() {
-  return SPOTIFY_CLIENT_ID && !SPOTIFY_CLIENT_ID.includes("SEU_CLIENT_ID_AQUI");
+// Remove ?code=&state= (ou ?error=) da barra de endereço após o retorno do Spotify.
+function cleanAuthParamsFromUrl() {
+  const cleanUrl = window.location.origin + window.location.pathname + window.location.hash;
+  window.history.replaceState({}, document.title, cleanUrl);
 }
 
-function saveAccessToken(tokenData) {
-  if (!tokenData || !tokenData.access_token) {
-    return;
-  }
-
-  localStorage.setItem(TOKEN_STORAGE_KEY, tokenData.access_token);
-
-  if (tokenData.refresh_token) {
-    localStorage.setItem("spotify_refresh_token", tokenData.refresh_token);
-  }
-
-  if (tokenData.expires_in) {
-    const expiresAt = Date.now() + Number(tokenData.expires_in) * 1000;
-    localStorage.setItem("spotify_token_expires_at", String(expiresAt));
-  }
-}
+// -----------------------------------------------------------------------------
+// PKCE
+// -----------------------------------------------------------------------------
 
 function base64UrlEncode(buffer) {
   const bytes = new Uint8Array(buffer);
@@ -72,12 +143,10 @@ function base64UrlEncode(buffer) {
     binary += String.fromCharCode(byte);
   });
 
-  return btoa(binary)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/g, "");
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
+// Code verifier: 64 caracteres do conjunto permitido pela RFC 7636 (43 a 128).
 function generateCodeVerifier() {
   const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
   const randomValues = new Uint32Array(64);
@@ -91,23 +160,99 @@ function generateCodeVerifier() {
   return verifier;
 }
 
+// Code challenge: base64url(SHA-256(verifier)) — método S256.
 async function generateCodeChallenge(verifier) {
-  const encoder = new TextEncoder();
-  const digest = await crypto.subtle.digest("SHA-256", encoder.encode(verifier));
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
   return base64UrlEncode(digest);
 }
 
 function generateOAuthState() {
-  const randomValues = new Uint32Array(8);
+  const randomValues = new Uint8Array(16);
   crypto.getRandomValues(randomValues);
   return base64UrlEncode(randomValues.buffer);
 }
 
+// -----------------------------------------------------------------------------
+// Armazenamento da sessão
+// -----------------------------------------------------------------------------
+
+function saveTokens(tokenData) {
+  if (!tokenData || !tokenData.access_token) {
+    return;
+  }
+
+  localStorage.setItem(TOKEN_STORAGE_KEY, tokenData.access_token);
+
+  // O Spotify pode ou não rotacionar o refresh token; só substituímos quando vier um novo.
+  if (tokenData.refresh_token) {
+    localStorage.setItem(REFRESH_TOKEN_KEY, tokenData.refresh_token);
+  }
+
+  const expiresInSeconds = Number(tokenData.expires_in) || 3600;
+  localStorage.setItem(TOKEN_EXPIRES_AT_KEY, String(Date.now() + expiresInSeconds * 1000));
+
+  scheduleTokenRefresh();
+}
+
+function getStoredUser() {
+  try {
+    const rawUser = localStorage.getItem(USER_STORAGE_KEY);
+    return rawUser ? JSON.parse(rawUser) : null;
+  } catch (error) {
+    console.warn("Dados do usuário armazenados em formato inválido.", error);
+    return null;
+  }
+}
+
+function getAccessToken() {
+  return localStorage.getItem(TOKEN_STORAGE_KEY) || null;
+}
+
+function getTokenExpiresAt() {
+  return Number(localStorage.getItem(TOKEN_EXPIRES_AT_KEY) || 0);
+}
+
+function isSessionExpired() {
+  const expiresAt = getTokenExpiresAt();
+  return Boolean(expiresAt && Date.now() >= expiresAt);
+}
+
+function isLoggedIn() {
+  return Boolean(getAccessToken()) && !isSessionExpired();
+}
+
+// Existe uma sessão utilizável: token válido ou refresh token para renová-lo.
+function hasSession() {
+  return Boolean(getAccessToken() || localStorage.getItem(REFRESH_TOKEN_KEY));
+}
+
+// Limpa todos os dados de autenticação (tokens, usuário, verifier e state).
+function clearSpotifySession() {
+  localStorage.removeItem(TOKEN_STORAGE_KEY);
+  localStorage.removeItem(REFRESH_TOKEN_KEY);
+  localStorage.removeItem(TOKEN_EXPIRES_AT_KEY);
+  localStorage.removeItem(USER_STORAGE_KEY);
+  sessionStorage.removeItem(CODE_VERIFIER_KEY);
+  sessionStorage.removeItem(OAUTH_STATE_KEY);
+  clearTimeout(refreshTimer);
+  refreshTimer = null;
+}
+
+// -----------------------------------------------------------------------------
+// Estados de sessão e interface (usa somente elementos existentes no index.html)
+// -----------------------------------------------------------------------------
+
+function getSessionState() {
+  return sessionState;
+}
+
 function renderLoggedOutState() {
   getAuthElements();
+
   if (spotifyConnectButton) {
     spotifyConnectButton.classList.remove("hidden");
   }
+
   if (spotifyUserPanel) {
     spotifyUserPanel.classList.add("hidden");
     spotifyUserPanel.innerHTML = "";
@@ -116,12 +261,10 @@ function renderLoggedOutState() {
 
 function renderLoggedInState(user) {
   getAuthElements();
-  const profileImage =
-    user.images && user.images.length > 0
-      ? user.images[0].url
-      : "https://placehold.co/80x80/1DB954/111111?text=SP";
 
-  const displayName = user.display_name || "Usuário Spotify";
+  const profileImage =
+    user?.images && user.images.length > 0 ? user.images[0].url : "https://placehold.co/80x80/1DB954/111111?text=SP";
+  const displayName = user?.display_name || "Usuário Spotify";
 
   if (spotifyConnectButton) {
     spotifyConnectButton.classList.add("hidden");
@@ -133,60 +276,93 @@ function renderLoggedInState(user) {
 
   spotifyUserPanel.classList.remove("hidden");
   spotifyUserPanel.innerHTML = `
-    <img class="spotify-user-avatar" src="${profileImage}" alt="Foto do perfil do usuário" />
+    <img class="spotify-user-avatar" src="${escapeHtml(profileImage)}" alt="Foto do perfil do usuário" />
     <div class="spotify-user-text">
       <span>Conectado como</span>
-      <strong>${displayName}</strong>
+      <strong>${escapeHtml(displayName)}</strong>
     </div>
     <button id="spotify-logout-btn" class="spotify-logout-btn" type="button">Sair</button>
   `;
 
-  const logoutButton = document.getElementById("spotify-logout-btn");
-  if (logoutButton) {
-    logoutButton.addEventListener("click", handleLogout);
+  document.getElementById("spotify-logout-btn")?.addEventListener("click", handleLogout);
+}
+
+function setLoggedIn(user) {
+  sessionState = SESSION_STATES.LOGGED_IN;
+  renderLoggedInState(user);
+}
+
+function setLoggedOut() {
+  sessionState = SESSION_STATES.LOGGED_OUT;
+  renderLoggedOutState();
+}
+
+// Estado "expirada": encerra a sessão local e solicita nova autenticação (uma única vez,
+// mesmo que várias requisições falhem ao mesmo tempo).
+function expireSession(showAlert = true) {
+  const wasActive = sessionState !== SESSION_STATES.EXPIRED && (sessionState === SESSION_STATES.LOGGED_IN || hasSession());
+
+  clearSpotifySession();
+  renderLoggedOutState();
+  sessionState = SESSION_STATES.EXPIRED;
+
+  if (!wasActive) {
+    return;
+  }
+
+  window.dispatchEvent(new CustomEvent("grooveflow:session-expired"));
+
+  if (showAlert) {
+    handleSpotifyError(SESSION_EXPIRED_MESSAGE);
   }
 }
 
-function handleSpotifyError(message) {
-  console.error(message);
-  window.alert(message);
+// Compatibilidade com chamadas antigas.
+function handleSessionExpired(showAlert = true) {
+  expireSession(showAlert);
 }
 
-async function fetchSpotifyProfile(accessToken) {
-  const response = await fetch("https://api.spotify.com/v1/me", {
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-    },
-  });
+async function handleSpotifyUnauthorized(showAlert = true) {
+  expireSession(showAlert);
+}
 
-  if (response.status === 401) {
-    handleSessionExpired(false);
-    throw new Error("Sua sessão do Spotify expirou. Faça login novamente para continuar.");
+// Logout: limpa tudo e volta ao estado "desconectado".
+function handleLogout() {
+  const hadSession = hasSession() || sessionState === SESSION_STATES.LOGGED_IN;
+
+  clearSpotifySession();
+  setLoggedOut();
+
+  if (hadSession) {
+    window.dispatchEvent(new CustomEvent("grooveflow:session-expired"));
   }
+}
 
-  if (!response.ok) {
-    throw new Error("Não foi possível carregar os dados do perfil do Spotify.");
+// -----------------------------------------------------------------------------
+// Tokens: troca do code, refresh automático
+// -----------------------------------------------------------------------------
+
+async function readTokenError(response) {
+  const rawBody = await response.text().catch(() => "");
+
+  try {
+    const data = rawBody ? JSON.parse(rawBody) : null;
+    return { error: data?.error || "request_failed", description: data?.error_description || rawBody };
+  } catch (error) {
+    return { error: "request_failed", description: rawBody };
   }
-
-  return response.json();
 }
 
 async function exchangeCodeForToken(code) {
   const codeVerifier = sessionStorage.getItem(CODE_VERIFIER_KEY);
 
   if (!codeVerifier) {
-    throw new Error("Código de verificação PKCE não encontrado. Reinicie o login.");
+    throw new Error("Código de verificação PKCE não encontrado. Clique em \"Conectar com Spotify\" novamente.");
   }
 
-  if (!/^.{43,128}$/.test(codeVerifier)) {
-    throw new Error("Code verifier inválido. Reinicie o login para gerar um novo valor.");
-  }
-
-  const response = await fetch("https://accounts.spotify.com/api/token", {
+  const response = await fetch(SPOTIFY_TOKEN_URL, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       client_id: SPOTIFY_CLIENT_ID,
       grant_type: "authorization_code",
@@ -196,28 +372,26 @@ async function exchangeCodeForToken(code) {
     }).toString(),
   });
 
+  // O verifier só vale para uma troca.
+  sessionStorage.removeItem(CODE_VERIFIER_KEY);
+  sessionStorage.removeItem(OAUTH_STATE_KEY);
+
   if (!response.ok) {
-    const rawBody = await response.text();
-    let errorData = null;
+    const { error, description } = await readTokenError(response);
 
-    try {
-      errorData = rawBody ? JSON.parse(rawBody) : null;
-    } catch (error) {
-      errorData = null;
+    if ((description || "").toLowerCase().includes("redirect")) {
+      throw new Error(`Redirect URI divergente. Cadastre exatamente esta URI no Dashboard: ${REDIRECT_URI}`);
     }
 
-    const spotifyError = errorData?.error || "request_failed";
-    const spotifyDescription = errorData?.error_description || rawBody || "Resposta desconhecida do Spotify.";
-
-    if (spotifyError === "invalid_grant") {
-      throw new Error("Código de autorização inválido ou expirado. Reinicie o processo de login.");
+    if (error === "invalid_grant") {
+      throw new Error("Código de autorização inválido ou expirado. Faça login novamente.");
     }
 
-    if (spotifyDescription.toLowerCase().includes("redirect")) {
-      throw new Error(`Redirect URI divergente. Cadastre exatamente: ${REDIRECT_URI}`);
+    if (error === "invalid_client") {
+      throw new Error("Client ID inválido. Confira o SPOTIFY_CLIENT_ID em js/auth.js.");
     }
 
-    throw new Error(`Erro ao trocar código por token: ${spotifyDescription}`);
+    throw new Error(`Erro ao trocar o código por token: ${description || error}`);
   }
 
   const tokenData = await response.json();
@@ -226,26 +400,228 @@ async function exchangeCodeForToken(code) {
     throw new Error("O Spotify não retornou um access_token.");
   }
 
-  saveAccessToken(tokenData);
+  saveTokens(tokenData);
 
-  const user = await fetchSpotifyProfile(tokenData.access_token);
+  const user = await spotifyFetch(`${SPOTIFY_API_BASE}/me`);
   localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(user));
-  sessionStorage.removeItem(CODE_VERIFIER_KEY);
-  sessionStorage.removeItem(OAUTH_STATE_KEY);
-  renderLoggedInState(user);
-
-  const cleanUrl = window.location.origin + window.location.pathname;
-  window.history.replaceState({}, document.title, cleanUrl);
+  setLoggedIn(user);
 }
+
+async function requestTokenRefresh() {
+  const refreshToken = localStorage.getItem(REFRESH_TOKEN_KEY);
+
+  if (!refreshToken) {
+    return null;
+  }
+
+  try {
+    const response = await fetch(SPOTIFY_TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: SPOTIFY_CLIENT_ID,
+      }).toString(),
+    });
+
+    if (!response.ok) {
+      const { error, description } = await readTokenError(response);
+      console.warn("Falha ao renovar o token do Spotify.", error, description);
+      return null;
+    }
+
+    const tokenData = await response.json();
+    saveTokens(tokenData);
+    return tokenData.access_token || null;
+  } catch (error) {
+    console.warn("Falha de rede ao renovar o token do Spotify.", error);
+    return null;
+  }
+}
+
+// Chamadas simultâneas compartilham o mesmo refresh, evitando que um refresh token
+// rotacionado seja usado duas vezes.
+function refreshAccessToken() {
+  if (!refreshPromise) {
+    refreshPromise = requestTokenRefresh().finally(() => {
+      refreshPromise = null;
+    });
+  }
+
+  return refreshPromise;
+}
+
+// Agenda a renovação automática um pouco antes de o token expirar.
+function scheduleTokenRefresh() {
+  clearTimeout(refreshTimer);
+  refreshTimer = null;
+
+  const expiresAt = getTokenExpiresAt();
+  if (!expiresAt || !localStorage.getItem(REFRESH_TOKEN_KEY)) {
+    return;
+  }
+
+  const delay = Math.max(0, expiresAt - Date.now() - REFRESH_MARGIN_MS);
+
+  refreshTimer = setTimeout(async () => {
+    const newToken = await refreshAccessToken();
+    if (!newToken && sessionState === SESSION_STATES.LOGGED_IN) {
+      expireSession(true);
+    }
+  }, delay);
+}
+
+// Devolve um access token válido, renovando-o se estiver perto de expirar.
+async function getValidAccessToken() {
+  const token = getAccessToken();
+  const expiresAt = getTokenExpiresAt();
+  const nearExpiry = !token || !expiresAt || Date.now() >= expiresAt - REFRESH_MARGIN_MS;
+
+  if (!nearExpiry) {
+    return token;
+  }
+
+  if (!localStorage.getItem(REFRESH_TOKEN_KEY)) {
+    return token && !isSessionExpired() ? token : null;
+  }
+
+  return refreshAccessToken();
+}
+
+// -----------------------------------------------------------------------------
+// spotifyFetch: ÚNICO ponto de acesso à Web API, usado por todos os módulos.
+// - adiciona o Bearer token (renovando-o se preciso);
+// - 401: tenta um refresh; se falhar, encerra a sessão e pede novo login;
+// - 403: mensagem sobre cadastro no Dashboard / permissão;
+// - 429: aguarda (Retry-After ou espera crescente) e tenta de novo.
+// Devolve o JSON da resposta, ou null quando não houver corpo (200/201/204 vazios).
+// -----------------------------------------------------------------------------
+
+function getRetryDelaySeconds(response, attempt) {
+  const retryAfter = Number(response.headers.get("Retry-After"));
+  return retryAfter > 0 ? retryAfter : 2 ** (attempt + 1); // 2s, 4s, 8s
+}
+
+async function readApiErrorMessage(response) {
+  try {
+    const data = await response.json();
+    return data?.error?.message || data?.error_description || "";
+  } catch (error) {
+    return "";
+  }
+}
+
+async function spotifyFetch(url, options = {}) {
+  const fullUrl = /^https?:\/\//i.test(url) ? url : `${SPOTIFY_API_BASE}${url.startsWith("/") ? "" : "/"}${url}`;
+  const hadSession = hasSession();
+  let triedRefreshAfter401 = false;
+  let rateLimitAttempts = 0;
+
+  while (true) {
+    const accessToken = await getValidAccessToken();
+
+    if (!accessToken) {
+      if (hadSession) {
+        expireSession(true);
+        throw createApiError(SESSION_EXPIRED_MESSAGE, 401);
+      }
+      throw createApiError(LOGIN_REQUIRED_MESSAGE, 401);
+    }
+
+    const hasBody = options.body !== undefined && options.body !== null;
+    let response;
+
+    try {
+      response = await fetch(fullUrl, {
+        ...options,
+        headers: {
+          Accept: "application/json",
+          ...(hasBody ? { "Content-Type": "application/json" } : {}),
+          ...(options.headers || {}),
+          Authorization: `Bearer ${accessToken}`,
+        },
+      });
+    } catch (error) {
+      throw createApiError("Não foi possível conectar ao Spotify. Verifique sua internet e tente novamente.", 0);
+    }
+
+    if (response.status === 401) {
+      // Token recusado: tenta renovar uma vez antes de encerrar a sessão.
+      if (!triedRefreshAfter401 && localStorage.getItem(REFRESH_TOKEN_KEY)) {
+        triedRefreshAfter401 = true;
+        localStorage.setItem(TOKEN_EXPIRES_AT_KEY, "1"); // força o refresh na próxima volta
+        continue;
+      }
+
+      expireSession(true);
+      throw createApiError(SESSION_EXPIRED_MESSAGE, 401);
+    }
+
+    if (response.status === 429) {
+      const delaySeconds = getRetryDelaySeconds(response, rateLimitAttempts);
+
+      if (rateLimitAttempts < MAX_RATE_LIMIT_RETRIES && delaySeconds <= MAX_RATE_LIMIT_WAIT_SECONDS) {
+        rateLimitAttempts += 1;
+        console.warn(`Spotify respondeu 429. Nova tentativa em ${delaySeconds}s (${rateLimitAttempts}/${MAX_RATE_LIMIT_RETRIES}).`);
+        await wait(delaySeconds * 1000);
+        continue;
+      }
+
+      throw createApiError(
+        `O Spotify recebeu muitas solicitações. Aguarde ${delaySeconds} segundos e tente novamente.`,
+        429
+      );
+    }
+
+    if (response.status === 403) {
+      const detail = await readApiErrorMessage(response);
+      throw createApiError(detail ? `${FORBIDDEN_MESSAGE} (Detalhe: ${detail})` : FORBIDDEN_MESSAGE, 403);
+    }
+
+    if (!response.ok) {
+      const detail = await readApiErrorMessage(response);
+      let message;
+
+      if (response.status === 400) {
+        message = detail ? `O Spotify recusou a solicitação: ${detail}` : "O Spotify recusou a solicitação.";
+      } else if (response.status === 404) {
+        message = "O item solicitado não foi encontrado no Spotify.";
+      } else if (response.status >= 500) {
+        message = "O Spotify está instável no momento. Tente novamente em instantes.";
+      } else {
+        message = detail || `A API do Spotify respondeu com o status ${response.status}.`;
+      }
+
+      throw createApiError(message, response.status);
+    }
+
+    const rawBody = await response.text();
+
+    if (!rawBody) {
+      return null;
+    }
+
+    try {
+      return JSON.parse(rawBody);
+    } catch (error) {
+      return null;
+    }
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Login e inicialização
+// -----------------------------------------------------------------------------
 
 async function startSpotifyLogin() {
   if (!isSpotifyConfigured()) {
-    handleSpotifyError("Configure o SPOTIFY_CLIENT_ID antes de testar a autenticação.");
+    handleSpotifyError("Configure o SPOTIFY_CLIENT_ID em js/auth.js antes de testar a autenticação.");
     return;
   }
 
   if (!window.crypto || !window.crypto.subtle) {
-    handleSpotifyError("Este navegador não oferece suporte necessário para autenticação PKCE.");
+    handleSpotifyError("Este navegador não oferece o suporte necessário para a autenticação PKCE.");
     return;
   }
 
@@ -256,7 +632,7 @@ async function startSpotifyLogin() {
   sessionStorage.setItem(CODE_VERIFIER_KEY, codeVerifier);
   sessionStorage.setItem(OAUTH_STATE_KEY, oauthState);
 
-  const authUrl = new URL("https://accounts.spotify.com/authorize");
+  const authUrl = new URL(SPOTIFY_AUTHORIZE_URL);
   authUrl.search = new URLSearchParams({
     client_id: SPOTIFY_CLIENT_ID,
     response_type: "code",
@@ -271,184 +647,55 @@ async function startSpotifyLogin() {
   window.location.href = authUrl.toString();
 }
 
-function handleLogout() {
-  localStorage.removeItem(TOKEN_STORAGE_KEY);
-  localStorage.removeItem(USER_STORAGE_KEY);
-  localStorage.removeItem("spotify_refresh_token");
-  localStorage.removeItem("spotify_token_expires_at");
-  sessionStorage.removeItem(CODE_VERIFIER_KEY);
-  sessionStorage.removeItem(OAUTH_STATE_KEY);
+async function restoreSavedSession() {
+  if (!hasSession()) {
+    localStorage.removeItem(USER_STORAGE_KEY);
+    setLoggedOut();
+    return false;
+  }
 
-  renderLoggedOutState();
-  window.dispatchEvent(new CustomEvent("grooveflow:session-expired"));
-}
-
-function isSessionExpired() {
-  const expiresAt = Number(localStorage.getItem("spotify_token_expires_at") || 0);
-  return Boolean(expiresAt && Date.now() >= expiresAt);
-}
-
-function isLoggedIn() {
-  const accessToken = localStorage.getItem(TOKEN_STORAGE_KEY);
-  return Boolean(accessToken) && !isSessionExpired();
-}
-
-async function getValidAccessToken() {
-  const token = localStorage.getItem(TOKEN_STORAGE_KEY);
-  const expiresAt = Number(localStorage.getItem("spotify_token_expires_at") || 0);
-
+  // Token vencido ou perto de vencer: tenta renovar antes de encerrar a sessão.
+  const token = await getValidAccessToken();
   if (!token) {
-    return null;
+    expireSession(true);
+    return false;
   }
 
-  if (expiresAt && Date.now() >= expiresAt - 60000) {
-    return refreshAccessToken();
-  }
+  scheduleTokenRefresh();
 
-  return token;
-}
-
-function getAccessToken() {
-  // Recupera o access token do armazenamento local usado pela autenticação PKCE.
-  return localStorage.getItem(TOKEN_STORAGE_KEY) || null;
-}
-
-function getSpotifyAuthorizationHeaders(extraHeaders = {}) {
-  // Todas as chamadas autenticadas à API devem enviar este cabeçalho Bearer.
-  const accessToken = getAccessToken();
-
-  if (!accessToken) {
-    return null;
-  }
-
-  return {
-    ...extraHeaders,
-    Authorization: `Bearer ${accessToken}`,
-  };
-}
-
-function clearSpotifySession() {
-  // Limpa todos os dados da sessão para impedir novas chamadas com credenciais antigas.
-  localStorage.removeItem(TOKEN_STORAGE_KEY);
-  localStorage.removeItem(USER_STORAGE_KEY);
-  localStorage.removeItem("spotify_refresh_token");
-  localStorage.removeItem("spotify_token_expires_at");
-  sessionStorage.removeItem(CODE_VERIFIER_KEY);
-  sessionStorage.removeItem(OAUTH_STATE_KEY);
-}
-
-async function handleSpotifyUnauthorized(showAlert = false) {
-  // Respostas 401 significam token inválido ou expirado no Spotify.
-  clearSpotifySession();
-  renderLoggedOutState();
-  window.dispatchEvent(new CustomEvent("grooveflow:session-expired"));
-
-  if (showAlert) {
-    handleSpotifyError("Sua sessão do Spotify expirou. Reconecte sua conta para continuar.");
-  }
-}
-
-async function fetchSpotifyApi(url, options = {}) {
-  const accessToken = await getValidAccessToken();
-
-  if (!accessToken) {
-    throw new Error("Faça login no Spotify para continuar.");
-  }
-
-  const response = await fetch(url, {
-    ...options,
-    headers: {
-      Accept: "application/json",
-      ...(!options.method || options.method === "GET"
-        ? {}
-        : { "Content-Type": "application/json" }),
-      Authorization: `Bearer ${accessToken}`,
-      ...(options.headers || {}),
-    },
-  });
-
-  if (response.status === 401) {
-    await handleSpotifyUnauthorized(false);
-    throw new Error("Sua sessão do Spotify expirou. Reconecte sua conta para continuar.");
-  }
-
-  if (!response.ok) {
-    let message = `A API do Spotify respondeu com o status ${response.status}.`;
-
-    try {
-      const errorData = await response.json();
-      message = errorData?.error?.message || errorData?.error_description || message;
-    } catch (error) {
-      // Mantém a mensagem padrão quando o Spotify não envia um corpo JSON.
-    }
-
-    throw new Error(message);
-  }
-
-  if (response.status === 204) {
-    return null;
-  }
-
-  return response.json();
-}
-
-function handleSessionExpired(showAlert = true) {
-  handleLogout();
-  if (showAlert) {
-    handleSpotifyError("Sua sessão do Spotify expirou. Reconecte sua conta para continuar.");
-  }
-}
-
-function getStoredUser() {
   try {
-    const rawUser = localStorage.getItem(USER_STORAGE_KEY);
-    return rawUser ? JSON.parse(rawUser) : null;
+    const user = await spotifyFetch(`${SPOTIFY_API_BASE}/me`);
+    localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(user));
+    setLoggedIn(user);
+    return true;
   } catch (error) {
-    console.warn("Dados do usuário armazenados em formato inválido.", error);
-    return null;
+    if (error.status === 401) {
+      return false; // spotifyFetch já encerrou a sessão e avisou o usuário.
+    }
+
+    if (error.status === 403) {
+      clearSpotifySession();
+      setLoggedOut();
+      handleSpotifyError(error.message);
+      return false;
+    }
+
+    // Falha temporária (rede, 429, 5xx): mantém a sessão e mostra o perfil salvo.
+    console.warn("Não foi possível atualizar o perfil do Spotify.", error);
+    const savedUser = getStoredUser();
+    if (savedUser) {
+      setLoggedIn(savedUser);
+      return true;
+    }
+
+    setLoggedOut();
+    return false;
   }
 }
-
-window.GrooveFlowAuth = {
-  startSpotifyLogin,
-  handleSessionExpired,
-  isSessionExpired,
-  isLoggedIn,
-  getAccessToken,
-  getValidAccessToken,
-  refreshAccessToken,
-  handleLogout,
-  getSpotifyAuthorizationHeaders,
-  clearSpotifySession,
-  handleSpotifyUnauthorized,
-  fetchSpotifyApi,
-  getUser: getStoredUser,
-  getRedirectUri: () => REDIRECT_URI,
-  getPkceConfiguration: () => ({
-    clientId: SPOTIFY_CLIENT_ID,
-    redirectUri: REDIRECT_URI,
-    scopes: SPOTIFY_SCOPES,
-  }),
-};
-
-window.SpotifyAuth = {
-  login: startSpotifyLogin,
-  logout: handleLogout,
-  getToken: getValidAccessToken,
-  getUser: () => {
-    try {
-      const rawUser = localStorage.getItem(USER_STORAGE_KEY);
-      return rawUser ? JSON.parse(rawUser) : null;
-    } catch (error) {
-      return null;
-    }
-  },
-  init: initializeAuth,
-};
 
 async function initializeAuth() {
   if (!getAuthElements()) {
-    return;
+    return hasSession();
   }
 
   // Evita registrar o mesmo listener mais de uma vez.
@@ -463,105 +710,125 @@ async function initializeAuth() {
   const authError = params.get("error");
 
   if (authError) {
-    handleSpotifyError(`Autenticação cancelada ou falhou: ${authError}`);
     sessionStorage.removeItem(CODE_VERIFIER_KEY);
     sessionStorage.removeItem(OAUTH_STATE_KEY);
-    window.history.replaceState({}, document.title, window.location.pathname);
-    renderLoggedOutState();
-    return;
+    cleanAuthParamsFromUrl();
+    handleSpotifyError(
+      authError === "access_denied"
+        ? "Login cancelado: a autorização no Spotify não foi concedida."
+        : `Autenticação falhou: ${authError}`
+    );
+    return restoreSavedSession();
   }
 
   if (authCode) {
     const expectedState = sessionStorage.getItem(OAUTH_STATE_KEY);
+    cleanAuthParamsFromUrl();
 
     if (!expectedState || !returnedState || returnedState !== expectedState) {
-      handleLogout();
+      clearSpotifySession();
+      setLoggedOut();
       handleSpotifyError("Falha na validação do estado OAuth. Tente entrar novamente.");
-      window.history.replaceState({}, document.title, window.location.pathname);
-      return;
+      return false;
     }
 
     try {
       await exchangeCodeForToken(authCode);
-      return;
+      return true;
     } catch (error) {
-      sessionStorage.removeItem(CODE_VERIFIER_KEY);
-      sessionStorage.removeItem(OAUTH_STATE_KEY);
-      window.history.replaceState({}, document.title, window.location.pathname);
+      // Login incompleto (ex.: 403 em /me quando a conta não está cadastrada no app):
+      // descarta os tokens para não deixar uma sessão inutilizável.
+      clearSpotifySession();
+      setLoggedOut();
       handleSpotifyError(error.message);
-      renderLoggedOutState();
-      return;
+      return false;
     }
   }
 
-  const savedUser = localStorage.getItem(USER_STORAGE_KEY);
-  const accessToken = localStorage.getItem(TOKEN_STORAGE_KEY);
-
-  if (isSessionExpired()) {
-    handleSessionExpired(true);
-    return;
-  }
-
-  if (accessToken) {
-    try {
-      const user = await fetchSpotifyProfile(accessToken);
-      localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(user));
-      renderLoggedInState(user);
-      return;
-    } catch (error) {
-      console.warn("Token salvo inválido.", error);
-      handleLogout();
-      return;
-    }
-  }
-
-  if (savedUser) {
-    localStorage.removeItem(USER_STORAGE_KEY);
-  }
-
-  renderLoggedOutState();
+  return restoreSavedSession();
 }
 
-function setupSpotifyAuth() {
-  if (!getAuthElements()) {
-    return;
-  }
-
-  initializeAuth();
+function whenReady() {
+  return authReady;
 }
 
-if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", setupSpotifyAuth, { once: true });
-} else {
-  setupSpotifyAuth();
+// -----------------------------------------------------------------------------
+// API pública
+// -----------------------------------------------------------------------------
+
+window.spotifyFetch = spotifyFetch;
+
+window.GrooveFlowAuth = {
+  spotifyFetch,
+  fetchSpotifyApi: spotifyFetch, // alias para compatibilidade
+  startSpotifyLogin,
+  handleLogout,
+  handleSessionExpired,
+  handleSpotifyUnauthorized,
+  clearSpotifySession,
+  getSessionState,
+  SESSION_STATES,
+  isSessionExpired,
+  isLoggedIn,
+  hasSession,
+  getAccessToken,
+  getValidAccessToken,
+  refreshAccessToken,
+  escapeHtml,
+  whenReady,
+  getUser: getStoredUser,
+  getRedirectUri: () => REDIRECT_URI,
+  getPkceConfiguration: () => ({
+    clientId: SPOTIFY_CLIENT_ID,
+    redirectUri: REDIRECT_URI,
+    scopes: SPOTIFY_SCOPES,
+  }),
+};
+
+window.SpotifyAuth = {
+  login: startSpotifyLogin,
+  logout: handleLogout,
+  getToken: getValidAccessToken,
+  getUser: getStoredUser,
+  init: initializeAuth,
+};
+
+async function setupSpotifyAuth() {
+  let loggedIn = false;
+
+  try {
+    loggedIn = await initializeAuth();
+  } catch (error) {
+    console.error("Erro ao inicializar a autenticação do Spotify.", error);
+    loggedIn = false;
+  }
+
+  resolveAuthReady(Boolean(loggedIn));
+
+  if (loggedIn) {
+    window.dispatchEvent(new CustomEvent("grooveflow:session-started"));
+  }
 }
 
-async function refreshAccessToken() {
-  const refreshToken = localStorage.getItem("spotify_refresh_token");
-
-  if (!refreshToken) {
-    handleLogout();
-    return null;
+// Ao voltar para a aba (timers podem ser congelados em segundo plano), confere o token.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && sessionState === SESSION_STATES.LOGGED_IN) {
+    getValidAccessToken().then((token) => {
+      if (!token) {
+        expireSession(true);
+      } else {
+        scheduleTokenRefresh();
+      }
+    });
   }
+});
 
-  const response = await fetch("https://accounts.spotify.com/api/token", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: refreshToken,
-      client_id: SPOTIFY_CLIENT_ID,
-    }).toString(),
-  });
+if (!IS_REDIRECTING_TO_LOOPBACK) {
+  console.info(`[GrooveFlow] Redirect URI usada no login: ${REDIRECT_URI}`);
 
-  if (!response.ok) {
-    handleLogout();
-    return null;
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", setupSpotifyAuth, { once: true });
+  } else {
+    setupSpotifyAuth();
   }
-
-  const tokenData = await response.json();
-  saveAccessToken(tokenData);
-  return tokenData.access_token;
 }
