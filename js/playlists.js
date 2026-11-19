@@ -8,6 +8,9 @@ const SpotifyPlaylists = (() => {
   const PLACEHOLDER_ART = "https://placehold.co/64x64/1DB954/111111?text=♪";
   const SEARCH_DEBOUNCE_MS = 350;
   const MAX_PAGES = 20;
+  const NOT_OWNED_ITEMS_MESSAGE =
+    "O Spotify não libera as músicas desta playlist: desde 2026, apps em modo de desenvolvimento só " +
+    "podem ver os itens de playlists criadas por você ou em que você é colaborador.";
 
   const playlistGrid = document.getElementById("playlist-grid");
   const openCreateButton = document.getElementById("open-create-playlist");
@@ -244,7 +247,13 @@ const SpotifyPlaylists = (() => {
   }
 
   async function unfollowPlaylist(playlist, button) {
-    const confirmed = window.confirm(`Deseja deixar de seguir a playlist "${playlist.name}"?`);
+    const isOwner = canModify(playlist) && !playlist.collaborative;
+    const confirmed = window.confirm(
+      isOwner
+        ? `Deseja remover a playlist "${playlist.name}" da sua biblioteca?\n\n` +
+            "Ela foi criada por você: o Spotify não apaga playlists, mas ela deixará de aparecer na sua biblioteca."
+        : `Deseja deixar de seguir a playlist "${playlist.name}"?`
+    );
 
     if (!confirmed) {
       return;
@@ -274,8 +283,14 @@ const SpotifyPlaylists = (() => {
     state.currentTrackPlaylistId = playlist.id;
     tracksModalTitle.textContent = `Músicas de ${playlist.name}`;
     tracksModal.classList.remove("hidden");
-    renderEmpty(playlistTrackList, "Carregando músicas...");
 
+    // Desde 2026 o Spotify só devolve os itens de playlists próprias ou colaborativas.
+    if (!canModify(playlist)) {
+      renderEmpty(playlistTrackList, NOT_OWNED_ITEMS_MESSAGE);
+      return;
+    }
+
+    renderEmpty(playlistTrackList, "Carregando músicas...");
     loadTracksForPlaylist(playlist.id);
   }
 
@@ -321,7 +336,10 @@ const SpotifyPlaylists = (() => {
         .join("");
     } catch (error) {
       if (state.currentTrackPlaylistId === playlistId) {
-        renderEmpty(playlistTrackList, error.message || "Não foi possível carregar as músicas.");
+        renderEmpty(
+          playlistTrackList,
+          error.status === 403 ? NOT_OWNED_ITEMS_MESSAGE : error.message || "Não foi possível carregar as músicas."
+        );
       }
     }
   }
@@ -344,7 +362,7 @@ const SpotifyPlaylists = (() => {
     try {
       await removeTrackFromPlaylist(playlistId, button.dataset.trackUri);
       await loadTracksForPlaylist(playlistId);
-      showToast("Música removida da playlist.");
+      showToast(`"${button.dataset.trackName}" foi removida da playlist.`);
     } catch (error) {
       button.disabled = false;
       showToast(error.message || "Não foi possível remover a música.");
