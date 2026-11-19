@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GrooveFlow</title>
+    <meta
+      name="description"
+      content="Interface inspirada no Spotify para organizar playlists, descobrir músicas e criar experiências colaborativas."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="css/style.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Menu lateral">
+        <div class="brand">
+          <div class="brand-mark">G</div>
+          <div>
+            <p class="brand-label">GrooveFlow</p>
+          </div>
+        </div>
+
+        <nav class="nav-menu" aria-label="Navegação principal">
+          <button class="nav-item active" type="button">
+            <span class="nav-icon">♫</span>
+            <span>Minhas Playlists</span>
+          </button>
+          <button class="nav-item" type="button">
+            <span class="nav-icon">👥</span>
+            <span>Sala com Amigos</span>
+          </button>
+          <button class="nav-item" type="button">
+            <span class="nav-icon">✨</span>
+            <span>Descobrir Músicas</span>
+          </button>
+        </nav>
+
+        <div class="library-card">
+          <p class="section-tag">Biblioteca</p>
+          <h3>Seu mundo musical</h3>
+          <p>Organize ideias, playlists e momentos de escuta.</p>
+        </div>
+      </aside>
+
+      <main class="main-panel">
+        <header class="topbar">
+          <label class="search-box" aria-label="Buscar músicas ou playlists">
+            <span class="search-icon">⌕</span>
+            <input type="search" placeholder="Buscar músicas, artistas ou playlists" />
+          </label>
+
+          <div class="spotify-auth">
+            <button id="spotify-connect-btn" class="connect-btn" type="button">
+              Conectar com Spotify
+            </button>
+            <div id="spotify-user-panel" class="spotify-user-panel hidden" aria-live="polite"></div>
+          </div>
+        </header>
+
+        <section class="hero-panel">
+          <div class="hero-copy">
+            <p class="eyebrow">Seu mix do dia</p>
+            <h1>Explore sons que combinam com seu humor.</h1>
+            <p>
+              Curadoria, playlists colaborativas e recomendações feitas para
+              acompanhar sua rotina.
+            </p>
+          </div>
+          <div class="hero-art" aria-hidden="true">
+            <div class="orb orb-one"></div>
+            <div class="orb orb-two"></div>
+            <div class="mini-card">
+              <span>🎧</span>
+              <div>
+                <strong>Morning Drive</strong>
+                <small>24 faixas</small>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="content-section">
+          <div class="section-header">
+            <div>
+              <p class="section-tag">Playlists</p>
+              <h2>Minhas Playlists</h2>
+            </div>
+            <button id="open-create-playlist" class="primary-btn" type="button">
+              + Nova playlist
+            </button>
+          </div>
+
+          <div id="playlist-grid" class="cards-grid" aria-live="polite"></div>
+        </section>
+
+        <section class="content-section search-section">
+          <div class="section-header">
+            <div>
+              <p class="section-tag">Busca</p>
+              <h2>Procurar músicas</h2>
+            </div>
+          </div>
+
+          <label class="search-box search-box-inline" aria-label="Buscar música ou artista">
+            <span class="search-icon">⌕</span>
+            <input id="track-search-input" type="search" placeholder="Digite uma música, artista ou estilo" />
+          </label>
+
+          <div id="search-results" class="search-results" aria-live="polite"></div>
+        </section>
+
+        <section class="content-section">
+          <div class="section-header">
+            <div>
+              <p class="section-tag">Descobertas</p>
+              <h2>Descobrir Músicas</h2>
+            </div>
+            <a href="#" class="link-more">Recomendar</a>
+          </div>
+
+          <div id="discover-vibes" class="discover-vibes" aria-label="Estilos musicais"></div>
+
+          <label class="search-box search-box-inline" aria-label="Buscar artista ou estilo musical">
+            <span class="search-icon">⌕</span>
+            <input id="discover-input" type="search" placeholder="Digite um artista ou vibe favorita" />
+          </label>
+
+          <div id="music-list" class="music-list" aria-live="polite"></div>
+        </section>
+
+        <section class="content-section collab-section">
+          <div class="section-header">
+            <div>
+              <p class="section-tag">Sala com Amigos</p>
+              <h2>Festa / Fila Colaborativa</h2>
+            </div>
+            <button id="collab-save-playlist" class="primary-btn" type="button">
+              Salvar Fila como Playlist
+            </button>
+          </div>
+
+          <div class="collab-toolbar">
+            <label class="search-box search-box-inline" aria-label="Buscar música para a fila da sala">
+              <span class="search-icon">⌕</span>
+              <input id="collab-search-input" type="search" placeholder="Busque uma música para a fila da sala" />
+            </label>
+          </div>
+
+          <div class="collab-room-tools">
+            <button id="collab-export-code" class="secondary-btn" type="button">Exportar Código da Sala</button>
+            <button id="collab-import-code" class="secondary-btn" type="button">Importar Código</button>
+          </div>
+
+          <textarea id="collab-room-code" rows="4" class="collab-share-box" placeholder="Cole aqui o código compartilhado da sala para importar a fila."></textarea>
+
+          <div id="collab-search-results" class="collab-search-results"></div>
+          <div id="collab-queue" class="collab-queue"></div>
+        </section>
+      </main>
+    </div>
+
+    <div id="playlist-modal" class="modal-overlay hidden" aria-modal="true" role="dialog">
+      <div class="modal-card">
+        <div class="modal-header">
+          <h3 id="playlist-modal-title">Nova playlist</h3>
+          <button id="close-playlist-modal" class="close-btn" type="button" aria-label="Fechar modal">
+            ×
+          </button>
+        </div>
+
+        <form id="playlist-form">
+          <label class="field-group">
+            <span>Nome</span>
+            <input id="playlist-name" type="text" maxlength="100" required />
+          </label>
+
+          <label class="field-group">
+            <span>Descrição</span>
+            <textarea id="playlist-description" rows="3" maxlength="300"></textarea>
+          </label>
+
+          <label class="checkbox-row">
+            <input id="playlist-public" type="checkbox" checked />
+            <span>Pública</span>
+          </label>
+
+          <div class="modal-actions">
+            <button id="cancel-playlist-modal" class="secondary-btn" type="button">Cancelar</button>
+            <button class="primary-btn" type="submit">Salvar playlist</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <div id="tracks-modal" class="modal-overlay hidden" aria-modal="true" role="dialog">
+      <div class="modal-card tracks-modal-card">
+        <div class="modal-header">
+          <h3 id="tracks-modal-title">Músicas da playlist</h3>
+          <button id="close-tracks-modal" class="close-btn" type="button" aria-label="Fechar lista de músicas">
+            ×
+          </button>
+        </div>
+
+        <div id="playlist-track-list" class="playlist-track-list"></div>
+
+        <div class="modal-actions">
+          <button id="cancel-tracks-modal" class="secondary-btn" type="button">Fechar</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="js/auth.js"></script>
+    <script src="js/playlists.js"></script>
+    <script src="js/discover.js"></script>
+    <script src="js/collab.js"></script>
+  </body>
+</html>
