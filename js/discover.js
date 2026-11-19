@@ -153,7 +153,10 @@ const DiscoverMusic = (() => {
     }
 
     const playlists = getWritablePlaylists();
-    const optionsHtml = playlists.length
+    const stillLoading = hasSession() && window.SpotifyPlaylists?.isLoaded && !window.SpotifyPlaylists.isLoaded();
+    const optionsHtml = stillLoading
+      ? '<option value="">Carregando playlists...</option>'
+      : playlists.length
       ? `<option value="">Escolha uma playlist</option>${playlists
           .map((playlist) => `<option value="${escapeHtml(playlist.id)}">${escapeHtml(playlist.name)}</option>`)
           .join("")}`

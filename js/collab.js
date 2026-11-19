@@ -354,6 +354,29 @@ const CollabRoom = (() => {
     }
   }
 
+  // Código da sala: JSON -> bytes UTF-8 (preserva acentos) -> base64.
+  function encodeRoomCode(payload) {
+    const bytes = new TextEncoder().encode(JSON.stringify(payload));
+    let binary = "";
+    bytes.forEach((byte) => {
+      binary += String.fromCharCode(byte);
+    });
+    return btoa(binary);
+  }
+
+  // Aceita base64 normal ou base64url, com ou sem "=" no final.
+  function decodeRoomCode(code) {
+    let base64 = code.replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/");
+    while (base64.length % 4) {
+      base64 += "=";
+    }
+
+    const binary = atob(base64);
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    const json = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return JSON.parse(json);
+  }
+
   function exportRoomCode() {
     const queue = loadQueue();
 
@@ -362,8 +385,7 @@ const CollabRoom = (() => {
       return;
     }
 
-    const payload = { queue };
-    const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
+    const encoded = encodeRoomCode({ app: "grooveflow", version: 1, queue });
 
     if (roomCodeBox) {
       roomCodeBox.value = encoded;
@@ -384,8 +406,7 @@ const CollabRoom = (() => {
     let parsed = null;
 
     try {
-      const decoded = decodeURIComponent(escape(atob(code)));
-      parsed = JSON.parse(decoded);
+      parsed = decodeRoomCode(code);
     } catch (error) {
       window.alert("Código inválido. Verifique se o texto foi copiado corretamente.");
       return;
